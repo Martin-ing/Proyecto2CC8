@@ -15,7 +15,9 @@ import java.nio.file.*;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Arrays;
 import java.util.Locale;
+import java.util.UUID;
 
 /**
  * Conversor incremental JPG/PNG/TIFF/BigTIFF -> pirámide RAW RGBA8888 + META.
@@ -68,7 +70,11 @@ public class ImageToRawConverter {
     private static final int MAX_ROWS_PER_REGION = 256;
     private static final long MIN_FREE_SPACE_MARGIN = 128L * 1024L * 1024L;
 
-    private static int imageSequence = 1;
+    /*
+     * A partir de una reducción 1/8 se usa promedio de área (box average).
+     * Para 1/1, 1/2 y 1/4 se conserva el muestreo rápido anterior.
+     */
+    private static final int BOX_AVERAGE_MIN_SAMPLE_FACTOR = 8;
 
     public static void main(String[] args) {
         try {
@@ -143,10 +149,9 @@ public class ImageToRawConverter {
                 .normalize();
     }
 
-    private static synchronized String nextImageId() {
-        String id = String.format(Locale.US, "IMG%03d", imageSequence);
-        imageSequence++;
-        return id;
+    private static String nextImageId() {
+        // UUID evita repetir IDs aunque el conversor se cierre y se vuelva a ejecutar.
+        return "IMG-" + UUID.randomUUID();
     }
 
     private static void convertImage(Path inputPath, Path outputRoot) {
@@ -267,7 +272,10 @@ public class ImageToRawConverter {
                         Path finalRawPath = imageDirectory.resolve(level.fileName);
                         Path tempRawPath = imageDirectory.resolve(level.fileName + ".part");
 
-                        int rowsPerRegion = calculateRowsPerRegion(level.width);
+                        boolean useBoxAverage = level.sampleFactor >= BOX_AVERAGE_MIN_SAMPLE_FACTOR;
+                        int rowsPerRegion = useBoxAverage
+                                ? calculateAverageRowsPerRegion(originalWidth, level.sampleFactor)
+                                : calculateRowsPerRegion(level.width);
 
                         System.out.println();
                         System.out.println("------------------------------------------------------------");
@@ -281,16 +289,31 @@ public class ImageToRawConverter {
                                 level.sampleFactor,
                                 humanBytes(level.rawBytes)
                         );
+                        System.out.println(
+                                "Método de reducción: " +
+                                (useBoxAverage ? "PROMEDIO DE ÁREA" : "MUESTREO DIRECTO")
+                        );
                         System.out.println("Filas/bloque decodificado: " + rowsPerRegion);
 
-                        writeRawLevelIncrementally(
-                                reader,
-                                originalWidth,
-                                originalHeight,
-                                level,
-                                tempRawPath,
-                                rowsPerRegion
-                        );
+                        if (useBoxAverage) {
+                            writeRawLevelAveraged(
+                                    reader,
+                                    originalWidth,
+                                    originalHeight,
+                                    level,
+                                    tempRawPath,
+                                    rowsPerRegion
+                            );
+                        } else {
+                            writeRawLevelIncrementally(
+                                    reader,
+                                    originalWidth,
+                                    originalHeight,
+                                    level,
+                                    tempRawPath,
+                                    rowsPerRegion
+                            );
+                        }
 
                         long generatedBytes = Files.size(tempRawPath);
 
@@ -586,6 +609,465 @@ public class ImageToRawConverter {
         }
     }
 
+    /**
+     * Genera un nivel reducido usando promedio de área (box average).
+     *
+     * Cada píxel de salida representa el promedio RGBA de todos los píxeles
+     * de la fuente cubiertos por su bloque sampleFactor x sampleFactor.
+     * En los bordes se promedian únicamente los píxeles que realmente existen.
+     *
+     * Para no cargar imágenes gigantes en RAM, se leen regiones acotadas por
+     * DECODE_BLOCK_BUDGET. Si una franja completa cabe en el presupuesto se
+     * procesan varias filas de salida a la vez; si no, se divide horizontalmente.
+     */
+    private static void writeRawLevelAveraged(
+            ImageReader reader,
+            int sourceWidth,
+            int sourceHeight,
+            LevelInfo level,
+            Path rawPath,
+            int rowsPerRegion
+    ) throws IOException {
+
+        long maxSourcePixels = Math.max(
+                1L,
+                DECODE_BLOCK_BUDGET / DECODE_BUDGET_BYTES_PER_PIXEL
+        );
+
+        long bytesWritten;
+        int nextProgressPercent = 1;
+
+        try (OutputStream out = Files.newOutputStream(
+                rawPath,
+                StandardOpenOption.CREATE_NEW,
+                StandardOpenOption.WRITE
+        )) {
+            RawBufferWriter writer = new RawBufferWriter(out);
+
+            /*
+             * Fast path: al menos una fila completa de bloques sampleFactor
+             * cabe en RAM. En ese caso leemos todo el ancho y varias filas de
+             * salida por región, reduciendo mucho la cantidad de reader.read().
+             */
+            boolean fullWidthBlockRowFits =
+                    (long) sourceWidth * level.sampleFactor <= maxSourcePixels;
+
+            if (fullWidthBlockRowFits) {
+                for (int outputY = 0; outputY < level.height; outputY += rowsPerRegion) {
+                    int requestedOutputRows = Math.min(
+                            rowsPerRegion,
+                            level.height - outputY
+                    );
+
+                    int sourceY = Math.toIntExact((long) outputY * level.sampleFactor);
+                    int sourceRegionHeight = (int) Math.min(
+                            (long) requestedOutputRows * level.sampleFactor,
+                            (long) sourceHeight - sourceY
+                    );
+
+                    BufferedImage region = readSourceRegion(
+                            reader,
+                            0,
+                            sourceY,
+                            sourceWidth,
+                            sourceRegionHeight
+                    );
+
+                    try {
+                        averageFullWidthRegion(
+                                region,
+                                sourceWidth,
+                                sourceHeight,
+                                sourceY,
+                                level,
+                                requestedOutputRows,
+                                writer
+                        );
+                    } finally {
+                        region.flush();
+                    }
+
+                    int processedRows = outputY + requestedOutputRows;
+                    int percent = (int) ((processedRows * 100L) / level.height);
+
+                    if (percent >= nextProgressPercent || processedRows == level.height) {
+                        System.out.printf(
+                                Locale.US,
+                                "level%d: %3d%% | filas %,d / %,d | escrito aprox. %s%n",
+                                level.level,
+                                percent,
+                                processedRows,
+                                level.height,
+                                humanBytes(Math.min(writer.getBytesWritten(), level.rawBytes))
+                        );
+                        nextProgressPercent = percent + 1;
+                    }
+                }
+            } else {
+                /*
+                 * Caso de una imagen extremadamente ancha: ni siquiera una fila
+                 * completa de sampleFactor píxeles de alto cabe en el presupuesto.
+                 * Se procesa una fila de salida a la vez y se divide en columnas.
+                 */
+                for (int outputY = 0; outputY < level.height; outputY++) {
+                    int sourceY = Math.toIntExact((long) outputY * level.sampleFactor);
+                    int sourceBlockHeight = (int) Math.min(
+                            (long) level.sampleFactor,
+                            (long) sourceHeight - sourceY
+                    );
+
+                    long maxSourceWidthForBlock = Math.max(
+                            1L,
+                            maxSourcePixels / Math.max(1, sourceBlockHeight)
+                    );
+
+                    int maxOutputColumns = (int) Math.max(
+                            1L,
+                            maxSourceWidthForBlock / level.sampleFactor
+                    );
+
+                    for (int outputX = 0; outputX < level.width; outputX += maxOutputColumns) {
+                        int outputColumns = Math.min(
+                                maxOutputColumns,
+                                level.width - outputX
+                        );
+
+                        int sourceX = Math.toIntExact((long) outputX * level.sampleFactor);
+                        int sourceRegionWidth = (int) Math.min(
+                                (long) outputColumns * level.sampleFactor,
+                                (long) sourceWidth - sourceX
+                        );
+
+                        /*
+                         * Si un único bloque sampleFactor x sampleFactor supera el
+                         * presupuesto, se divide también en franjas verticales y se
+                         * acumula sin perder píxeles.
+                         */
+                        if ((long) sourceRegionWidth * sourceBlockHeight <= maxSourcePixels) {
+                            BufferedImage region = readSourceRegion(
+                                    reader,
+                                    sourceX,
+                                    sourceY,
+                                    sourceRegionWidth,
+                                    sourceBlockHeight
+                            );
+
+                            try {
+                                averageSingleOutputRowRegion(
+                                        region,
+                                        sourceRegionWidth,
+                                        sourceBlockHeight,
+                                        outputColumns,
+                                        level.sampleFactor,
+                                        writer
+                                );
+                            } finally {
+                                region.flush();
+                            }
+                        } else {
+                            averageOversizedSingleOutputRow(
+                                    reader,
+                                    sourceX,
+                                    sourceY,
+                                    sourceRegionWidth,
+                                    sourceBlockHeight,
+                                    outputColumns,
+                                    level.sampleFactor,
+                                    maxSourcePixels,
+                                    writer
+                            );
+                        }
+                    }
+
+                    int processedRows = outputY + 1;
+                    int percent = (int) ((processedRows * 100L) / level.height);
+
+                    if (percent >= nextProgressPercent || processedRows == level.height) {
+                        System.out.printf(
+                                Locale.US,
+                                "level%d: %3d%% | filas %,d / %,d | escrito aprox. %s%n",
+                                level.level,
+                                percent,
+                                processedRows,
+                                level.height,
+                                humanBytes(Math.min(writer.getBytesWritten(), level.rawBytes))
+                        );
+                        nextProgressPercent = percent + 1;
+                    }
+                }
+            }
+
+            writer.finish();
+            bytesWritten = writer.getBytesWritten();
+
+        } catch (IOException | RuntimeException e) {
+            Files.deleteIfExists(rawPath);
+            throw e;
+        }
+
+        if (bytesWritten != level.rawBytes) {
+            Files.deleteIfExists(rawPath);
+            throw new IOException(
+                    "Cantidad de bytes RAW incorrecta para level" + level.level +
+                    ". Esperado=" + level.rawBytes + ", escrito=" + bytesWritten
+            );
+        }
+    }
+
+    private static BufferedImage readSourceRegion(
+            ImageReader reader,
+            int x,
+            int y,
+            int width,
+            int height
+    ) throws IOException {
+        ImageReadParam param = reader.getDefaultReadParam();
+        param.setSourceRegion(new Rectangle(x, y, width, height));
+
+        BufferedImage region = reader.read(0, param);
+
+        if (region == null) {
+            throw new IOException(
+                    "El lector devolvió null para la región fuente " +
+                    x + "," + y + " " + width + "x" + height
+            );
+        }
+
+        if (region.getWidth() != width || region.getHeight() != height) {
+            region.flush();
+            throw new IOException(
+                    "El lector devolvió una región con dimensiones inesperadas: " +
+                    region.getWidth() + "x" + region.getHeight() +
+                    ", esperado " + width + "x" + height
+            );
+        }
+
+        return region;
+    }
+
+    private static void averageFullWidthRegion(
+            BufferedImage region,
+            int sourceWidth,
+            int sourceHeight,
+            int globalSourceY,
+            LevelInfo level,
+            int outputRows,
+            RawBufferWriter writer
+    ) throws IOException {
+
+        long[] sumR = new long[level.width];
+        long[] sumG = new long[level.width];
+        long[] sumB = new long[level.width];
+        long[] sumA = new long[level.width];
+        int[] argbScratch = new int[Math.min(sourceWidth, PIXEL_SCRATCH_PIXELS)];
+
+        for (int outputLocalY = 0; outputLocalY < outputRows; outputLocalY++) {
+            Arrays.fill(sumR, 0L);
+            Arrays.fill(sumG, 0L);
+            Arrays.fill(sumB, 0L);
+            Arrays.fill(sumA, 0L);
+
+            int localSourceYStart = outputLocalY * level.sampleFactor;
+            int localSourceYEnd = Math.min(
+                    localSourceYStart + level.sampleFactor,
+                    region.getHeight()
+            );
+            int blockHeight = localSourceYEnd - localSourceYStart;
+
+            for (int sourceLocalY = localSourceYStart;
+                 sourceLocalY < localSourceYEnd;
+                 sourceLocalY++) {
+
+                for (int x0 = 0; x0 < sourceWidth; x0 += argbScratch.length) {
+                    int count = Math.min(argbScratch.length, sourceWidth - x0);
+
+                    region.getRGB(
+                            x0,
+                            sourceLocalY,
+                            count,
+                            1,
+                            argbScratch,
+                            0,
+                            count
+                    );
+
+                    for (int i = 0; i < count; i++) {
+                        int sourceX = x0 + i;
+                        int outputX = sourceX / level.sampleFactor;
+                        int argb = argbScratch[i];
+
+                        sumA[outputX] += (argb >>> 24) & 0xFF;
+                        sumR[outputX] += (argb >>> 16) & 0xFF;
+                        sumG[outputX] += (argb >>> 8) & 0xFF;
+                        sumB[outputX] += argb & 0xFF;
+                    }
+                }
+            }
+
+            int globalOutputY = (globalSourceY / level.sampleFactor) + outputLocalY;
+            int globalSourceYStart = globalOutputY * level.sampleFactor;
+            int actualBlockHeight = Math.min(
+                    level.sampleFactor,
+                    sourceHeight - globalSourceYStart
+            );
+
+            if (actualBlockHeight != blockHeight) {
+                throw new IOException("Altura de bloque inconsistente durante el promedio.");
+            }
+
+            for (int outputX = 0; outputX < level.width; outputX++) {
+                int sourceXStart = outputX * level.sampleFactor;
+                int blockWidth = Math.min(
+                        level.sampleFactor,
+                        sourceWidth - sourceXStart
+                );
+
+                long pixelCount = (long) blockWidth * actualBlockHeight;
+
+                writer.writeRgba(
+                        roundedAverage(sumR[outputX], pixelCount),
+                        roundedAverage(sumG[outputX], pixelCount),
+                        roundedAverage(sumB[outputX], pixelCount),
+                        roundedAverage(sumA[outputX], pixelCount)
+                );
+            }
+        }
+    }
+
+    private static void averageSingleOutputRowRegion(
+            BufferedImage region,
+            int sourceRegionWidth,
+            int sourceRegionHeight,
+            int outputColumns,
+            int sampleFactor,
+            RawBufferWriter writer
+    ) throws IOException {
+
+        long[] sumR = new long[outputColumns];
+        long[] sumG = new long[outputColumns];
+        long[] sumB = new long[outputColumns];
+        long[] sumA = new long[outputColumns];
+        int[] argbScratch = new int[Math.min(sourceRegionWidth, PIXEL_SCRATCH_PIXELS)];
+
+        for (int y = 0; y < sourceRegionHeight; y++) {
+            for (int x0 = 0; x0 < sourceRegionWidth; x0 += argbScratch.length) {
+                int count = Math.min(argbScratch.length, sourceRegionWidth - x0);
+
+                region.getRGB(x0, y, count, 1, argbScratch, 0, count);
+
+                for (int i = 0; i < count; i++) {
+                    int localSourceX = x0 + i;
+                    int outputX = localSourceX / sampleFactor;
+                    int argb = argbScratch[i];
+
+                    sumA[outputX] += (argb >>> 24) & 0xFF;
+                    sumR[outputX] += (argb >>> 16) & 0xFF;
+                    sumG[outputX] += (argb >>> 8) & 0xFF;
+                    sumB[outputX] += argb & 0xFF;
+                }
+            }
+        }
+
+        for (int outputX = 0; outputX < outputColumns; outputX++) {
+            int sourceXStart = outputX * sampleFactor;
+            int blockWidth = Math.min(
+                    sampleFactor,
+                    sourceRegionWidth - sourceXStart
+            );
+            long pixelCount = (long) blockWidth * sourceRegionHeight;
+
+            writer.writeRgba(
+                    roundedAverage(sumR[outputX], pixelCount),
+                    roundedAverage(sumG[outputX], pixelCount),
+                    roundedAverage(sumB[outputX], pixelCount),
+                    roundedAverage(sumA[outputX], pixelCount)
+            );
+        }
+    }
+
+    private static void averageOversizedSingleOutputRow(
+            ImageReader reader,
+            int sourceX,
+            int sourceY,
+            int sourceRegionWidth,
+            int sourceRegionHeight,
+            int outputColumns,
+            int sampleFactor,
+            long maxSourcePixels,
+            RawBufferWriter writer
+    ) throws IOException {
+
+        long[] sumR = new long[outputColumns];
+        long[] sumG = new long[outputColumns];
+        long[] sumB = new long[outputColumns];
+        long[] sumA = new long[outputColumns];
+
+        int stripeHeight = (int) Math.max(
+                1L,
+                maxSourcePixels / Math.max(1, sourceRegionWidth)
+        );
+
+        for (int yOffset = 0; yOffset < sourceRegionHeight; yOffset += stripeHeight) {
+            int height = Math.min(stripeHeight, sourceRegionHeight - yOffset);
+
+            BufferedImage stripe = readSourceRegion(
+                    reader,
+                    sourceX,
+                    sourceY + yOffset,
+                    sourceRegionWidth,
+                    height
+            );
+
+            try {
+                int[] argbScratch = new int[Math.min(sourceRegionWidth, PIXEL_SCRATCH_PIXELS)];
+
+                for (int y = 0; y < stripe.getHeight(); y++) {
+                    for (int x0 = 0; x0 < sourceRegionWidth; x0 += argbScratch.length) {
+                        int count = Math.min(argbScratch.length, sourceRegionWidth - x0);
+                        stripe.getRGB(x0, y, count, 1, argbScratch, 0, count);
+
+                        for (int i = 0; i < count; i++) {
+                            int localSourceX = x0 + i;
+                            int outputX = localSourceX / sampleFactor;
+                            int argb = argbScratch[i];
+
+                            sumA[outputX] += (argb >>> 24) & 0xFF;
+                            sumR[outputX] += (argb >>> 16) & 0xFF;
+                            sumG[outputX] += (argb >>> 8) & 0xFF;
+                            sumB[outputX] += argb & 0xFF;
+                        }
+                    }
+                }
+            } finally {
+                stripe.flush();
+            }
+        }
+
+        for (int outputX = 0; outputX < outputColumns; outputX++) {
+            int sourceXStart = outputX * sampleFactor;
+            int blockWidth = Math.min(
+                    sampleFactor,
+                    sourceRegionWidth - sourceXStart
+            );
+            long pixelCount = (long) blockWidth * sourceRegionHeight;
+
+            writer.writeRgba(
+                    roundedAverage(sumR[outputX], pixelCount),
+                    roundedAverage(sumG[outputX], pixelCount),
+                    roundedAverage(sumB[outputX], pixelCount),
+                    roundedAverage(sumA[outputX], pixelCount)
+            );
+        }
+    }
+
+    private static int roundedAverage(long sum, long count) throws IOException {
+        if (count <= 0L) {
+            throw new IOException("No hay píxeles para calcular el promedio.");
+        }
+
+        return (int) ((sum + count / 2L) / count);
+    }
+
     private static ImageReader selectReader(ImageInputStream input) throws IOException {
         input.seek(0);
 
@@ -672,6 +1154,30 @@ public class ImageToRawConverter {
         }
 
         rows = Math.min(rows, MAX_ROWS_PER_REGION);
+
+        return (int) rows;
+    }
+
+    private static int calculateAverageRowsPerRegion(
+            int sourceWidth,
+            int sampleFactor
+    ) {
+        long maxSourcePixels = Math.max(
+                1L,
+                DECODE_BLOCK_BUDGET / DECODE_BUDGET_BYTES_PER_PIXEL
+        );
+
+        long pixelsPerOutputRow = Math.multiplyExact(
+                (long) sourceWidth,
+                (long) sampleFactor
+        );
+
+        if (pixelsPerOutputRow > maxSourcePixels) {
+            return 1;
+        }
+
+        long rows = maxSourcePixels / Math.max(1L, pixelsPerOutputRow);
+        rows = Math.max(1L, Math.min(rows, MAX_ROWS_PER_REGION));
 
         return (int) rows;
     }
@@ -892,6 +1398,47 @@ public class ImageToRawConverter {
         } while (value >= 1024.0 && unit < units.length - 1);
 
         return String.format(Locale.US, "%.2f %s", value, units[unit]);
+    }
+
+    private static final class RawBufferWriter {
+        private final OutputStream out;
+        private final byte[] buffer = new byte[OUTPUT_BUFFER_SIZE];
+        private int position = 0;
+        private long bytesWritten = 0L;
+
+        RawBufferWriter(OutputStream out) {
+            this.out = out;
+        }
+
+        void writeRgba(int r, int g, int b, int a) throws IOException {
+            if (position + 4 > buffer.length) {
+                flushBuffer();
+            }
+
+            buffer[position++] = (byte) r;
+            buffer[position++] = (byte) g;
+            buffer[position++] = (byte) b;
+            buffer[position++] = (byte) a;
+        }
+
+        long getBytesWritten() {
+            return bytesWritten + position;
+        }
+
+        void finish() throws IOException {
+            flushBuffer();
+            out.flush();
+        }
+
+        private void flushBuffer() throws IOException {
+            if (position == 0) {
+                return;
+            }
+
+            out.write(buffer, 0, position);
+            bytesWritten += position;
+            position = 0;
+        }
     }
 
     private static final class LevelInfo {
