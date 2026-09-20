@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cliente de imágenes</title>
+    <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+    <main class="container">
+        <h1>Cliente de imágenes</h1>
+        <p>
+            Este cliente web se ejecuta independientemente del servidor Java y
+            se conecta a él mediante WebSocket.
+        </p>
+
+        <button id="loadFilesButton" disabled>Solicitar ARCHIVOS</button>
+
+        <label class="format-control" for="rootFormat">
+            Formato de ROOT:
+            <select id="rootFormat">
+                <option value="RGBA8888" selected>RGBA8888 (4 bytes/píxel)</option>
+                <option value="RGBA4444">RGBA4444 (2 bytes/píxel)</option>
+            </select>
+        </label>
+
+        <p id="status">Conectando con el servidor Java...</p>
+
+        <section>
+            <h2>Imágenes disponibles</h2>
+            <div id="imageList" class="image-list">
+                <p class="empty">Todavía no se ha solicitado el catálogo.</p>
+            </div>
+        </section>
+
+        <section id="viewerSection" class="viewer-section" hidden>
+            <h2 id="viewerTitle">ROOT</h2>
+            <p id="rootProgress"></p>
+            <div class="canvas-wrapper">
+                <canvas id="rootCanvas" width="1024" height="1024"></canvas>
+            </div>
+        </section>
+    </main>
+
+    <script src="./app.js"></script>
+</body>
+</html>

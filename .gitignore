@@ -1,0 +1,9 @@
+target/
+
+Server/Imagenes/
+
+.vscode/
+
+.idea/
+
+*.raw
