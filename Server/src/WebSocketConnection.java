@@ -18,10 +18,6 @@ public class WebSocketConnection {
         this.output = output;
     }
 
-    /**
-     * Lee el siguiente mensaje de texto. Devuelve null cuando la conexión se cierra.
-     * En esta primera fase, cliente -> servidor solo utiliza mensajes de texto.
-     */
     public String readTextMessage() throws IOException {
         while (!closed) {
             int first = input.read();
@@ -53,7 +49,6 @@ public class WebSocketConnection {
                 throw new IOException("Payload WebSocket demasiado grande: " + payloadLength);
             }
 
-            // Los frames enviados por un navegador hacia el servidor deben ir enmascarados.
             if (!masked) {
                 throw new IOException("El frame recibido del cliente no está enmascarado");
             }
@@ -66,18 +61,18 @@ public class WebSocketConnection {
             }
 
             switch (opcode) {
-                case 0x1: // text
+                case 0x1:
                     return new String(payload, StandardCharsets.UTF_8);
-                case 0x2: // binary
+                case 0x2:
                     throw new IOException("No se esperan frames binarios desde el cliente todavía");
-                case 0x8: // close
+                case 0x8:
                     sendClose();
                     closed = true;
                     return null;
-                case 0x9: // ping
-                    sendFrame(0xA, payload); // pong
+                case 0x9:
+                    sendFrame(0xA, payload);
                     break;
-                case 0xA: // pong
+                case 0xA:
                     break;
                 default:
                     throw new IOException("Opcode WebSocket no soportado: " + opcode);
@@ -127,7 +122,6 @@ public class WebSocketConnection {
             }
         }
 
-        // Los frames servidor -> cliente NO van enmascarados.
         output.write(payload);
         output.flush();
     }

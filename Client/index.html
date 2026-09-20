@@ -36,6 +36,30 @@
         <section id="viewerSection" class="viewer-section" hidden>
             <h2 id="viewerTitle">ROOT</h2>
             <p id="rootProgress"></p>
+
+            <div id="navigationControls" class="navigation-controls" hidden>
+                <div class="zoom-controls">
+                    <button id="zoomOutButton" type="button">− Zoom</button>
+                    <strong id="zoomInfo">ROOT</strong>
+                    <button id="zoomInButton" type="button">+ Zoom</button>
+                </div>
+
+                <div class="pan-controls" aria-label="Desplazamiento por tiles">
+                    <span></span>
+                    <button id="panUpButton" type="button">↑</button>
+                    <span></span>
+                    <button id="panLeftButton" type="button">←</button>
+                    <button id="panDownButton" type="button">↓</button>
+                    <button id="panRightButton" type="button">→</button>
+                </div>
+
+                <p id="tileProgress"></p>
+                <p class="hint">
+                    El desplazamiento mueve la ventana un tile (256 px). Los tiles se
+                    transmiten en RGBA4444; ROOT conserva el formato seleccionado arriba.
+                </p>
+            </div>
+
             <div class="canvas-wrapper">
                 <canvas id="rootCanvas" width="1024" height="1024"></canvas>
             </div>

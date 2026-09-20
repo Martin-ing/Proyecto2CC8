@@ -21,6 +21,7 @@ button {
 
 button:disabled {
     cursor: not-allowed;
+    opacity: 0.55;
 }
 
 .image-list {
@@ -49,6 +50,49 @@ button:disabled {
 
 .viewer-section {
     margin-top: 28px;
+}
+
+.navigation-controls {
+    margin: 14px 0;
+    padding: 12px;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+}
+
+.zoom-controls {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+}
+
+#zoomInfo {
+    min-width: 280px;
+}
+
+.pan-controls {
+    display: grid;
+    grid-template-columns: repeat(3, 48px);
+    gap: 6px;
+    width: max-content;
+    margin-bottom: 10px;
+}
+
+.pan-controls button {
+    width: 48px;
+    height: 42px;
+    padding: 0;
+}
+
+#tileProgress {
+    margin: 8px 0;
+}
+
+.hint {
+    margin: 6px 0 0;
+    color: #666;
+    font-size: 14px;
 }
 
 .canvas-wrapper {

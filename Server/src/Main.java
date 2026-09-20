@@ -26,26 +26,9 @@ public class Main {
 
         Path current = Path.of("").toAbsolutePath().normalize();
 
-        /*
-         * Buscamos hacia arriba porque Java puede estar ejecutándose desde:
-         *
-         * Proyecto2cc8/
-         * Proyecto2cc8/Server/
-         * Proyecto2cc8/Server/src/
-         * Proyecto2cc8/Server/out/
-         *
-         * etc.
-         */
         Path base = current;
 
         while (base != null) {
-
-            // Caso:
-            //
-            // Server/
-            // ├── Imagenes/
-            // │   └── images/
-            //
             Path directCandidate =
                     base.resolve("Imagenes")
                             .resolve("images")
@@ -54,14 +37,6 @@ public class Main {
             if (Files.isDirectory(directCandidate)) {
                 return directCandidate;
             }
-
-            // Caso:
-            //
-            // Proyecto2cc8/
-            // └── Server/
-            //     └── Imagenes/
-            //         └── images/
-            //
             Path serverCandidate =
                     base.resolve("Server")
                             .resolve("Imagenes")

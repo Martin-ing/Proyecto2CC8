@@ -76,26 +76,41 @@ public class ImageServer {
     }
 
     private void handleProtocol(WebSocketConnection connection) throws IOException {
-        String message;
+        ClientTileSession tileSession = new ClientTileSession(connection, imageCatalog);
+        tileSession.start();
 
-        while ((message = connection.readTextMessage()) != null) {
-            message = message.trim();
-            if (message.isEmpty()) {
-                continue;
+        try {
+            String message;
+
+            while ((message = connection.readTextMessage()) != null) {
+                message = message.trim();
+                if (message.isEmpty()) {
+                    continue;
+                }
+
+                System.out.println("[PROTOCOLO] Recibido: " + message);
+                String[] parts = message.split("\\s+");
+                String command = parts[0];
+
+                if ("ARCHIVOS".equals(command)) {
+                    handleArchivos(parts, connection);
+                } else if ("ROOT".equals(command)) {
+                    handleRoot(parts, connection, tileSession);
+                } else if ("VIEWPORT".equals(command)) {
+                    tileSession.handleViewport(parts);
+                } else if ("TILE_ACK".equals(command)) {
+                    tileSession.handleTileAck(parts);
+                } else if ("TILE_EVICT".equals(command)) {
+                    tileSession.handleTileEvict(parts);
+                } else if ("CANCEL".equals(command)) {
+                    tileSession.handleCancel(parts);
+                } else {
+                    String requestId = parts.length > 1 ? parts[1] : "0";
+                    connection.sendText("ERROR " + requestId + " UNKNOWN_COMMAND Comando no soportado");
+                }
             }
-
-            System.out.println("[PROTOCOLO] Recibido: " + message);
-            String[] parts = message.split("\\s+");
-            String command = parts[0];
-
-            if ("ARCHIVOS".equals(command)) {
-                handleArchivos(parts, connection);
-            } else if ("ROOT".equals(command)) {
-                handleRoot(parts, connection);
-            } else {
-                String requestId = parts.length > 1 ? parts[1] : "0";
-                connection.sendText("ERROR " + requestId + " UNKNOWN_COMMAND Comando no soportado");
-            }
+        } finally {
+            tileSession.close();
         }
     }
 
@@ -136,7 +151,11 @@ public class ImageServer {
         }
     }
 
-    private void handleRoot(String[] parts, WebSocketConnection connection) throws IOException {
+    private void handleRoot(
+            String[] parts,
+            WebSocketConnection connection,
+            ClientTileSession tileSession
+    ) throws IOException {
         if (parts.length != 4) {
             connection.sendText(
                     "ERROR 0 BAD_REQUEST Formato esperado: "
@@ -175,6 +194,8 @@ public class ImageServer {
                 );
                 return;
             }
+
+            tileSession.selectImage(imageId);
 
             System.out.println("[ROOT] Iniciando ROOT de " + imageId
                     + " en " + format.protocolName()

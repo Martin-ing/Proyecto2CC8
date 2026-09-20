@@ -28,9 +28,6 @@ public record ImageMeta(
         String fallbackId = metaPath.getParent().getFileName().toString();
         String id = cleanProtocolField(values.getOrDefault("id", fallbackId));
         String name = cleanProtocolField(values.getOrDefault("name", id));
-
-        // El protocolo nuevo usa originalWidth/originalHeight. Se conservan
-        // width/height como fallback para no romper metadatos de pruebas viejas.
         int originalWidth = parsePositiveIntWithFallback(values, "originalWidth", "width", metaPath);
         int originalHeight = parsePositiveIntWithFallback(values, "originalHeight", "height", metaPath);
 
@@ -42,8 +39,6 @@ public record ImageMeta(
                 ? parsePositiveInt(values, "tileSize", metaPath)
                 : 256;
 
-        // La versión más nueva del conversor usa level0Size; una versión anterior
-        // del documento lo llamó rootSize. Aceptamos ambos nombres.
         int level0Size;
         if (values.containsKey("level0Size")) {
             level0Size = parsePositiveInt(values, "level0Size", metaPath);
@@ -63,8 +58,6 @@ public record ImageMeta(
             String fileKey = prefix + "file";
 
             if (!values.containsKey(fileKey)) {
-                // Para esta primera fase ROOT solo exige level 0. Los demás niveles
-                // podrán validarse estrictamente cuando implementemos VIEWPORT/tiles.
                 if (zoom == 0) {
                     throw new IOException("Falta el campo '" + fileKey + "' en " + metaPath);
                 }

@@ -60,17 +60,20 @@ public class RootStreamer {
         int rootBytes = (int) rootBytesLong;
         int chunkCount = (rootBytes + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
-        connection.sendText(
-                "ROOT_START " + requestId + " " + image.id()
-                        + " " + rootSize + " " + rootSize
-                        + " " + format.protocolName()
-                        + " " + CHUNK_SIZE + " " + chunkCount
-        );
+        // Evita que una ROOT se intercale con una secuencia TILE_* si el usuario
+        // cambia de imagen mientras todavía hay tiles pendientes.
+        synchronized (connection) {
+            connection.sendText(
+                    "ROOT_START " + requestId + " " + image.id()
+                            + " " + rootSize + " " + rootSize
+                            + " " + format.protocolName()
+                            + " " + CHUNK_SIZE + " " + chunkCount
+            );
 
-        byte[] chunk = new byte[CHUNK_SIZE];
-        byte[] rawRow = new byte[level.width() * BYTES_PER_RGBA8888_PIXEL];
+            byte[] chunk = new byte[CHUNK_SIZE];
+            byte[] rawRow = new byte[level.width() * BYTES_PER_RGBA8888_PIXEL];
 
-        try (RandomAccessFile raw = new RandomAccessFile(level.rawPath().toFile(), "r")) {
+            try (RandomAccessFile raw = new RandomAccessFile(level.rawPath().toFile(), "r")) {
             for (int chunkIndex = 0; chunkIndex < chunkCount; chunkIndex++) {
                 Arrays.fill(chunk, (byte) 0);
 
@@ -118,9 +121,10 @@ public class RootStreamer {
                 );
                 connection.sendBinary(chunk, 0, dataLength);
             }
-        }
+            }
 
-        connection.sendText("ROOT_END " + requestId);
+            connection.sendText("ROOT_END " + requestId);
+        }
     }
 
     private static void copyRgba8888Row(
