@@ -1,71 +1,13 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="es">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Cliente de imágenes</title>
-    <link rel="stylesheet" href="./styles.css">
-</head>
-<body>
-    <main class="container">
-        <h1>Cliente de imágenes</h1>
-        <p>
-            Este cliente web se ejecuta independientemente del servidor Java y
-            se conecta a él mediante WebSocket.
-        </p>
-
-        <button id="loadFilesButton" disabled>Solicitar ARCHIVOS</button>
-
-        <label class="format-control" for="rootFormat">
-            Formato de ROOT:
-            <select id="rootFormat">
-                <option value="RGBA8888" selected>RGBA8888 (4 bytes/píxel)</option>
-                <option value="RGBA4444">RGBA4444 (2 bytes/píxel)</option>
-            </select>
-        </label>
-
-        <p id="status">Conectando con el servidor Java...</p>
-        <p id="channelStatus" class="channel-status">CONTROL: ... | CURRENT: ... | PREVIOUS: ... | NEXT: ...</p>
-
-        <section>
-            <h2>Imágenes disponibles</h2>
-            <div id="imageList" class="image-list">
-                <p class="empty">Todavía no se ha solicitado el catálogo.</p>
-            </div>
-        </section>
-
-        <section id="viewerSection" class="viewer-section" hidden>
-            <h2 id="viewerTitle">ROOT</h2>
-            <p id="rootProgress"></p>
-
-            <div id="navigationControls" class="navigation-controls" hidden>
-                <div class="zoom-controls">
-                    <button id="zoomOutButton" type="button">− Zoom</button>
-                    <strong id="zoomInfo">ROOT</strong>
-                    <button id="zoomInButton" type="button">+ Zoom</button>
-                </div>
-
-                <div class="pan-controls" aria-label="Desplazamiento por tiles">
-                    <span></span>
-                    <button id="panUpButton" type="button">↑</button>
-                    <span></span>
-                    <button id="panLeftButton" type="button">←</button>
-                    <button id="panDownButton" type="button">↓</button>
-                    <button id="panRightButton" type="button">→</button>
-                </div>
-
-                <p id="tileProgress"></p>
-                <p class="hint">
-                    El desplazamiento mueve la ventana un tile (256 px). Los tiles se transmiten en RGBA4444. CURRENT, PREVIOUS y NEXT viajan por tres conexiones WebSocket de datos independientes; ROOT y los mensajes de control usan CONTROL.
-                </p>
-            </div>
-
-            <div class="canvas-wrapper">
-                <canvas id="rootCanvas" width="1024" height="1024"></canvas>
-            </div>
-        </section>
-    </main>
-
-    <script src="./app.js"></script>
-</body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#163e32" />
+    <title>Visor de imágenes · CC8</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
 </html>
