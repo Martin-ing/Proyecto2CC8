@@ -1,5 +1,6 @@
 const loadFilesButton = document.getElementById("loadFilesButton");
 const statusElement = document.getElementById("status");
+const channelStatusElement = document.getElementById("channelStatus");
 const imageList = document.getElementById("imageList");
 const viewerSection = document.getElementById("viewerSection");
 const viewerTitle = document.getElementById("viewerTitle");
@@ -21,11 +22,13 @@ const panRightButton = document.getElementById("panRightButton");
 const TILE_SIZE = 256;
 const VIEWPORT_TILES = 4;
 const VIEWPORT_PIXELS = TILE_SIZE * VIEWPORT_TILES;
+const SERVER_WEBSOCKET_URL = "ws://localhost:8080/ws";
+const DATA_CHANNELS = ["CURRENT", "PREVIOUS", "NEXT"];
 
 let nextRequestId = 1;
 let nextViewId = 1;
+let sessionId = null;
 let rootReception = null;
-let tileReception = null;
 let currentRootButton = null;
 
 let selectedImage = null;
@@ -37,68 +40,76 @@ let currentView = {
     viewId: null
 };
 
-// La cache guarda los bytes del protocolo (RGBA4444), no ImageData expandido.
-// Así 64 tiles ocupan ~8 MiB en lugar de ~16 MiB.
+// La cache conserva RGBA4444, 128 KiB por tile 256x256.
 const tileCache = new Map();
 let desiredTileKeys = new Set();
 
-const SERVER_WEBSOCKET_URL = "ws://localhost:8080/ws";
-const socket = new WebSocket(SERVER_WEBSOCKET_URL);
-socket.binaryType = "arraybuffer";
+const dataConnections = new Map();
+for (const channel of DATA_CHANNELS) {
+    dataConnections.set(channel, {
+        channel,
+        socket: null,
+        joined: false,
+        stream: null
+    });
+}
 
-socket.addEventListener("open", () => {
-    statusElement.textContent = `Conectado a ${SERVER_WEBSOCKET_URL}`;
-    loadFilesButton.disabled = false;
+// -----------------------------------------------------------------------------
+// CUATRO CONEXIONES: CONTROL + CURRENT + PREVIOUS + NEXT
+// -----------------------------------------------------------------------------
+
+const controlSocket = new WebSocket(SERVER_WEBSOCKET_URL);
+controlSocket.binaryType = "arraybuffer";
+
+controlSocket.addEventListener("open", () => {
+    statusElement.textContent = "Conexión CONTROL abierta. Creando sesión...";
+    controlSocket.send("SESSION_OPEN");
 });
 
-socket.addEventListener("close", () => {
-    statusElement.textContent = "La conexión con el servidor Java se cerró.";
+controlSocket.addEventListener("close", () => {
+    statusElement.textContent = "La conexión CONTROL con el servidor se cerró.";
     loadFilesButton.disabled = true;
     setRootButtonsDisabled(true);
     disableNavigation();
+    closeDataSockets();
+    updateChannelStatus();
 });
 
-socket.addEventListener("error", () => {
+controlSocket.addEventListener("error", () => {
     statusElement.textContent =
-        "No se pudo conectar al servidor Java. Verifica que esté ejecutándose en el puerto 8080.";
+        "No se pudo conectar al servidor Java. Verifica el puerto 8080.";
 });
 
-socket.addEventListener("message", (event) => {
+controlSocket.addEventListener("message", (event) => {
     if (typeof event.data === "string") {
-        handleProtocolMessage(event.data);
+        handleControlMessage(event.data);
         return;
     }
 
     if (event.data instanceof ArrayBuffer) {
-        handleBinaryMessage(event.data);
+        handleControlBinary(event.data);
         return;
     }
 
-    console.warn("Tipo de mensaje WebSocket no reconocido:", event.data);
+    console.warn("Tipo de mensaje CONTROL no reconocido:", event.data);
 });
 
-loadFilesButton.addEventListener("click", () => {
-    if (!ensureSocketOpen()) {
-        return;
-    }
-
-    const requestId = nextRequestId++;
-    const message = `ARCHIVOS ${requestId}`;
-    socket.send(message);
-    statusElement.textContent = `Enviado: ${message}`;
-});
-
-zoomInButton.addEventListener("click", zoomIn);
-zoomOutButton.addEventListener("click", zoomOut);
-panUpButton.addEventListener("click", () => panBy(0, -1));
-panDownButton.addEventListener("click", () => panBy(0, 1));
-panLeftButton.addEventListener("click", () => panBy(-1, 0));
-panRightButton.addEventListener("click", () => panBy(1, 0));
-
-function handleProtocolMessage(message) {
+function handleControlMessage(message) {
     const lines = message.replace(/\r/g, "").split("\n");
     const header = lines[0].trim().split(/\s+/);
     const command = header[0];
+
+    if (command === "SESSION_OK") {
+        if (header.length !== 2) {
+            statusElement.textContent = "SESSION_OK inválido.";
+            return;
+        }
+        sessionId = header[1];
+        statusElement.textContent = `Sesión ${sessionId} creada. Abriendo 3 canales de datos...`;
+        openDataSockets();
+        updateChannelStatus();
+        return;
+    }
 
     if (command === "ARCHIVOS_OK") {
         handleArchivosOk(header, lines);
@@ -116,25 +127,155 @@ function handleProtocolMessage(message) {
         handleRootEnd(header);
         return;
     }
-    if (command === "TILE_START") {
-        handleTileStart(header);
-        return;
-    }
-    if (command === "TILE_DATA") {
-        handleTileDataHeader(header);
-        return;
-    }
-    if (command === "TILE_END") {
-        handleTileEnd(header);
-        return;
-    }
     if (command === "ERROR") {
         handleError(message, header);
         return;
     }
 
-    console.warn("Mensaje del protocolo no reconocido:", message);
+    console.warn("Mensaje CONTROL no reconocido:", message);
 }
+
+function openDataSockets() {
+    for (const channel of DATA_CHANNELS) {
+        const state = dataConnections.get(channel);
+        if (state.socket && state.socket.readyState <= WebSocket.OPEN) {
+            continue;
+        }
+
+        const socket = new WebSocket(SERVER_WEBSOCKET_URL);
+        socket.binaryType = "arraybuffer";
+        state.socket = socket;
+        state.joined = false;
+        state.stream = null;
+
+        socket.addEventListener("open", () => {
+            socket.send(`SESSION_JOIN ${sessionId} ${channel}`);
+            updateChannelStatus();
+        });
+
+        socket.addEventListener("message", (event) => {
+            handleDataMessage(channel, event.data);
+        });
+
+        socket.addEventListener("close", () => {
+            if (state.socket === socket) {
+                state.joined = false;
+                state.stream = null;
+            }
+            loadFilesButton.disabled = !allConnectionsReady();
+            updateChannelStatus();
+        });
+
+        socket.addEventListener("error", () => {
+            state.joined = false;
+            loadFilesButton.disabled = true;
+            updateChannelStatus();
+        });
+    }
+}
+
+function closeDataSockets() {
+    for (const state of dataConnections.values()) {
+        if (state.socket) {
+            try {
+                state.socket.close();
+            } catch (_) {
+            }
+        }
+        state.socket = null;
+        state.joined = false;
+        state.stream = null;
+    }
+}
+
+function handleDataMessage(channel, data) {
+    const state = dataConnections.get(channel);
+
+    if (typeof data === "string") {
+        const header = data.trim().split(/\s+/);
+        const command = header[0];
+
+        if (command === "SESSION_JOINED") {
+            if (header[1] !== sessionId || header[2] !== channel) {
+                console.error(`SESSION_JOINED inválido para ${channel}:`, data);
+                return;
+            }
+            state.joined = true;
+            loadFilesButton.disabled = !allConnectionsReady();
+            updateChannelStatus();
+            if (allConnectionsReady()) {
+                statusElement.textContent =
+                    "Sesión lista: CONTROL + CURRENT + PREVIOUS + NEXT conectados.";
+            }
+            return;
+        }
+
+        if (command === "TILE_STREAM_START") {
+            handleTileStreamStart(channel, header);
+            return;
+        }
+
+        if (command === "TILE_STREAM_END") {
+            handleTileStreamEnd(channel, header);
+            return;
+        }
+
+        if (command === "ERROR") {
+            console.error(`[${channel}] ${data}`);
+            statusElement.textContent = data;
+            return;
+        }
+
+        console.warn(`[${channel}] Mensaje no reconocido:`, data);
+        return;
+    }
+
+    if (data instanceof ArrayBuffer) {
+        handleTileStreamBinary(channel, data);
+        return;
+    }
+
+    console.warn(`[${channel}] Tipo de mensaje desconocido`, data);
+}
+
+function allConnectionsReady() {
+    if (!sessionId || controlSocket.readyState !== WebSocket.OPEN) {
+        return false;
+    }
+    return DATA_CHANNELS.every(channel => {
+        const state = dataConnections.get(channel);
+        return state.joined && state.socket?.readyState === WebSocket.OPEN;
+    });
+}
+
+function updateChannelStatus() {
+    if (!channelStatusElement) {
+        return;
+    }
+
+    const control = sessionId && controlSocket.readyState === WebSocket.OPEN ? "OK" : "...";
+    const pieces = [`CONTROL: ${control}`];
+    for (const channel of DATA_CHANNELS) {
+        const state = dataConnections.get(channel);
+        pieces.push(`${channel}: ${state.joined ? "OK" : "..."}`);
+    }
+    channelStatusElement.textContent = pieces.join(" | ");
+}
+
+// -----------------------------------------------------------------------------
+// ARCHIVOS
+// -----------------------------------------------------------------------------
+
+loadFilesButton.addEventListener("click", () => {
+    if (!ensureControlOpen()) {
+        return;
+    }
+
+    const requestId = nextRequestId++;
+    const message = `ARCHIVOS ${requestId}`;
+    controlSocket.send(message);
+    statusElement.textContent = `Enviado: ${message}`;
+});
 
 function handleArchivosOk(header, lines) {
     const requestId = header[1];
@@ -157,7 +298,7 @@ function handleArchivosOk(header, lines) {
 }
 
 // -----------------------------------------------------------------------------
-// ROOT
+// ROOT: sigue viajando por CONTROL
 // -----------------------------------------------------------------------------
 
 function handleRootStart(header) {
@@ -171,21 +312,16 @@ function handleRootStart(header) {
     const height = Number(heightText);
     const chunkSize = Number(chunkSizeText);
     const chunkCount = Number(chunkCountText);
-
     const bytesPerPixel = bytesPerPixelForFormat(format);
-    if (bytesPerPixel === null) {
-        failRoot(`Formato ROOT no soportado: ${format}`);
-        return;
-    }
 
-    if (!Number.isInteger(width) || !Number.isInteger(height)
+    if (bytesPerPixel === null
+        || !Number.isInteger(width) || !Number.isInteger(height)
         || !Number.isInteger(chunkSize) || !Number.isInteger(chunkCount)
         || width <= 0 || height <= 0 || chunkSize <= 0 || chunkCount <= 0) {
         failRoot("Metadata inválida en ROOT_START");
         return;
     }
 
-    const totalBytes = width * height * bytesPerPixel;
     rootReception = {
         requestId,
         imageId,
@@ -194,7 +330,7 @@ function handleRootStart(header) {
         format,
         chunkSize,
         chunkCount,
-        buffer: new Uint8Array(totalBytes),
+        buffer: new Uint8Array(width * height * bytesPerPixel),
         receivedChunks: new Set(),
         awaitingChunk: null
     };
@@ -237,7 +373,12 @@ function handleRootDataHeader(header) {
     rootReception.awaitingChunk = { chunkIndex, dataLength };
 }
 
-function handleRootBinary(arrayBuffer) {
+function handleControlBinary(arrayBuffer) {
+    if (!rootReception || !rootReception.awaitingChunk) {
+        console.warn("Llegó binario por CONTROL sin ROOT_DATA pendiente.");
+        return;
+    }
+
     const { chunkIndex, dataLength } = rootReception.awaitingChunk;
     const chunk = new Uint8Array(arrayBuffer);
 
@@ -270,12 +411,8 @@ function handleRootEnd(header) {
         return;
     }
 
-    if (rootReception.awaitingChunk !== null) {
-        failRoot("ROOT_END llegó antes del binario del último chunk");
-        return;
-    }
-
-    if (rootReception.receivedChunks.size !== rootReception.chunkCount) {
+    if (rootReception.awaitingChunk !== null
+        || rootReception.receivedChunks.size !== rootReception.chunkCount) {
         failRoot(
             `ROOT incompleto: ${rootReception.receivedChunks.size}/${rootReception.chunkCount} chunks`
         );
@@ -305,7 +442,7 @@ function handleRootEnd(header) {
 }
 
 function requestRoot(image, button) {
-    if (!ensureSocketOpen()) {
+    if (!ensureControlOpen()) {
         return;
     }
     if (rootReception !== null) {
@@ -313,10 +450,9 @@ function requestRoot(image, button) {
         return;
     }
 
-    // ROOT abre/reinicia una imagen. El servidor también cancela su estado de tiles.
     clearTileCache(false);
     desiredTileKeys = new Set();
-    tileReception = null;
+    clearDataStreamStates();
     rootSnapshot = null;
     selectedImage = image;
     currentView = { zoom: 0, currentX: 0, currentY: 0, viewId: null };
@@ -333,7 +469,7 @@ function requestRoot(image, button) {
     rootProgress.textContent = "Esperando ROOT_START...";
     clearCanvas();
 
-    socket.send(message);
+    controlSocket.send(message);
     statusElement.textContent = `Enviado: ${message}`;
 }
 
@@ -360,200 +496,193 @@ function showRootSnapshot() {
 }
 
 // -----------------------------------------------------------------------------
-// TILES / VIEWPORT
+// STREAMS DE TILES: 3 conexiones paralelas
 // -----------------------------------------------------------------------------
 
-function handleTileStart(header) {
-    if (header.length !== 12) {
-        failTile("TILE_START inválido");
+function handleTileStreamStart(channel, header) {
+    const state = dataConnections.get(channel);
+
+    if (header.length < 10) {
+        failDataStream(channel, "TILE_STREAM_START inválido");
         return;
     }
 
-    if (tileReception !== null) {
-        failTile("Llegó TILE_START mientras otro tile seguía en recepción");
-        return;
-    }
-
-    const [,
-        tileRequestId,
-        viewId,
-        imageId,
-        zoomText,
-        tileXText,
-        tileYText,
-        widthText,
-        heightText,
-        format,
-        chunkSizeText,
-        chunkCountText
-    ] = header;
+    const [, streamId, viewId, imageId, channelInMessage,
+        zoomText, format, tileSizeText, tileBytesText, countText, ...coords] = header;
 
     const zoom = Number(zoomText);
-    const tileX = Number(tileXText);
-    const tileY = Number(tileYText);
-    const width = Number(widthText);
-    const height = Number(heightText);
-    const chunkSize = Number(chunkSizeText);
-    const chunkCount = Number(chunkCountText);
+    const tileSize = Number(tileSizeText);
+    const tileBytes = Number(tileBytesText);
+    const count = Number(countText);
     const bytesPerPixel = bytesPerPixelForFormat(format);
 
-    if (bytesPerPixel === null
-        || !Number.isInteger(zoom) || !Number.isInteger(tileX) || !Number.isInteger(tileY)
-        || !Number.isInteger(width) || !Number.isInteger(height)
-        || !Number.isInteger(chunkSize) || !Number.isInteger(chunkCount)
-        || zoom < 1 || tileX < 0 || tileY < 0
-        || width <= 0 || height <= 0 || chunkSize <= 0 || chunkCount <= 0) {
-        failTile("Metadata inválida en TILE_START");
+    if (channelInMessage !== channel
+        || bytesPerPixel === null
+        || !Number.isInteger(zoom) || zoom < 1
+        || !Number.isInteger(tileSize) || tileSize <= 0
+        || !Number.isInteger(tileBytes) || tileBytes <= 0
+        || !Number.isInteger(count) || count < 0
+        || coords.length !== count
+        || tileBytes !== tileSize * tileSize * bytesPerPixel) {
+        failDataStream(channel, "Metadata inválida en TILE_STREAM_START");
         return;
     }
 
-    tileReception = {
-        tileRequestId,
+    const tiles = [];
+    for (const coordinate of coords) {
+        const [xText, yText] = coordinate.split(",");
+        const tileX = Number(xText);
+        const tileY = Number(yText);
+        if (!Number.isInteger(tileX) || !Number.isInteger(tileY)
+            || tileX < 0 || tileY < 0) {
+            failDataStream(channel, `Coordenada inválida: ${coordinate}`);
+            return;
+        }
+        tiles.push({ tileX, tileY });
+    }
+
+    state.stream = {
+        streamId,
         viewId,
         imageId,
+        channel,
         zoom,
-        tileX,
-        tileY,
-        width,
-        height,
         format,
-        chunkSize,
-        chunkCount,
-        buffer: new Uint8Array(width * height * bytesPerPixel),
-        receivedChunks: new Set(),
-        awaitingChunk: null
+        tileSize,
+        tileBytes,
+        plannedCount: count,
+        tiles,
+        receivedCount: 0
     };
+
+    updateTileProgress();
 }
 
-function handleTileDataHeader(header) {
-    if (!tileReception) {
-        console.warn("Llegó TILE_DATA sin TILE_START previo.");
+function handleTileStreamBinary(channel, arrayBuffer) {
+    const state = dataConnections.get(channel);
+    const stream = state.stream;
+
+    if (!stream) {
+        console.warn(`[${channel}] Binario recibido sin TILE_STREAM_START.`);
         return;
     }
 
-    const [, tileRequestId, chunkIndexText, dataLengthText] = header;
-    const chunkIndex = Number(chunkIndexText);
-    const dataLength = Number(dataLengthText);
-
-    if (tileRequestId !== tileReception.tileRequestId) {
-        failTile(`TILE_DATA pertenece a otra solicitud: ${tileRequestId}`);
+    const index = stream.receivedCount;
+    if (index >= stream.tiles.length) {
+        failDataStream(channel, "Llegaron más tiles binarios que los anunciados");
         return;
     }
 
-    if (!Number.isInteger(chunkIndex) || chunkIndex < 0
-        || chunkIndex >= tileReception.chunkCount
-        || !Number.isInteger(dataLength) || dataLength <= 0
-        || dataLength > tileReception.chunkSize) {
-        failTile("Cabecera TILE_DATA inválida");
-        return;
-    }
-
-    if (tileReception.awaitingChunk !== null) {
-        failTile("Llegó otro TILE_DATA antes del binario anterior");
-        return;
-    }
-
-    tileReception.awaitingChunk = { chunkIndex, dataLength };
-}
-
-function handleTileBinary(arrayBuffer) {
-    const { chunkIndex, dataLength } = tileReception.awaitingChunk;
-    const chunk = new Uint8Array(arrayBuffer);
-
-    if (chunk.byteLength !== dataLength) {
-        failTile(
-            `Tile ${tileReception.tileRequestId}, chunk ${chunkIndex}: ` +
-            `se esperaban ${dataLength} bytes y llegaron ${chunk.byteLength}`
+    if (arrayBuffer.byteLength !== stream.tileBytes) {
+        failDataStream(
+            channel,
+            `Tile ${index}: se esperaban ${stream.tileBytes} bytes y llegaron ${arrayBuffer.byteLength}`
         );
         return;
     }
 
-    const destinationOffset = chunkIndex * tileReception.chunkSize;
-    if (destinationOffset + dataLength > tileReception.buffer.length) {
-        failTile(`Chunk ${chunkIndex} excede el tamaño del tile`);
-        return;
-    }
+    const descriptor = stream.tiles[index];
+    const tile = {
+        imageId: stream.imageId,
+        zoom: stream.zoom,
+        tileX: descriptor.tileX,
+        tileY: descriptor.tileY,
+        width: stream.tileSize,
+        height: stream.tileSize,
+        format: stream.format,
+        buffer: new Uint8Array(arrayBuffer)
+    };
 
-    tileReception.buffer.set(chunk, destinationOffset);
-    tileReception.receivedChunks.add(chunkIndex);
-    tileReception.awaitingChunk = null;
-}
+    stream.receivedCount++;
 
-function handleTileEnd(header) {
-    const tileRequestId = header[1];
-
-    if (!tileReception || tileRequestId !== tileReception.tileRequestId) {
-        console.warn("TILE_END no corresponde al tile actual.");
-        return;
-    }
-
-    if (tileReception.awaitingChunk !== null
-        || tileReception.receivedChunks.size !== tileReception.chunkCount) {
-        failTile(
-            `Tile ${tileRequestId} incompleto: ` +
-            `${tileReception.receivedChunks.size}/${tileReception.chunkCount} chunks`
+    // ACK individual, pero por la conexión CONTROL.
+    if (ensureControlOpen(false)) {
+        controlSocket.send(
+            `TILE_ACK ${tile.imageId} ${tile.zoom} ${tile.tileX} ${tile.tileY}`
         );
-        return;
     }
 
-    const completed = tileReception;
-    tileReception = null;
-
-    // ACK de aplicación: el tile llegó completo al navegador.
-    if (ensureSocketOpen(false)) {
-        socket.send(`TILE_ACK ${tileRequestId}`);
-    }
-
-    const key = tileKey(
-        completed.imageId,
-        completed.zoom,
-        completed.tileX,
-        completed.tileY
-    );
-
+    const key = tileKey(tile.imageId, tile.zoom, tile.tileX, tile.tileY);
     const stillUseful = selectedImage
-        && completed.imageId === selectedImage.id
+        && tile.imageId === selectedImage.id
         && desiredTileKeys.has(key);
 
     if (stillUseful) {
-        tileCache.set(key, {
-            imageId: completed.imageId,
-            zoom: completed.zoom,
-            tileX: completed.tileX,
-            tileY: completed.tileY,
-            width: completed.width,
-            height: completed.height,
-            format: completed.format,
-            buffer: completed.buffer
-        });
-
-        drawTileIfVisible(tileCache.get(key));
-    } else if (ensureSocketOpen(false)) {
-        // Llegó un tile de una vista anterior después de que el usuario se movió.
-        socket.send(
-            `TILE_EVICT ${completed.imageId} ${completed.zoom} ${completed.tileX} ${completed.tileY}`
+        tileCache.set(key, tile);
+        drawTileIfVisible(tile);
+    } else if (ensureControlOpen(false)) {
+        // Se confirmó que llegó, pero la vista ya cambió y no se conservará.
+        controlSocket.send(
+            `TILE_EVICT ${tile.imageId} ${tile.zoom} ${tile.tileX} ${tile.tileY}`
         );
     }
 
     updateTileProgress();
 }
 
-function handleBinaryMessage(arrayBuffer) {
-    if (rootReception && rootReception.awaitingChunk) {
-        handleRootBinary(arrayBuffer);
+function handleTileStreamEnd(channel, header) {
+    const state = dataConnections.get(channel);
+    const stream = state.stream;
+
+    if (!stream) {
+        console.warn(`[${channel}] TILE_STREAM_END sin stream activo.`);
         return;
     }
 
-    if (tileReception && tileReception.awaitingChunk) {
-        handleTileBinary(arrayBuffer);
+    const [, streamId, sentCountText] = header;
+    const sentCount = Number(sentCountText);
+
+    if (streamId !== stream.streamId
+        || !Number.isInteger(sentCount)
+        || sentCount < 0
+        || sentCount > stream.plannedCount) {
+        failDataStream(channel, "TILE_STREAM_END inválido");
         return;
     }
 
-    console.warn("Llegó un frame binario sin ROOT_DATA/TILE_DATA pendiente.");
+    if (stream.receivedCount !== sentCount) {
+        console.warn(
+            `[${channel}] Stream ${streamId}: END dice ${sentCount}, ` +
+            `pero el navegador recibió ${stream.receivedCount}.`
+        );
+    }
+
+    console.log(
+        `[${channel}] stream ${streamId} finalizado: ` +
+        `${stream.receivedCount}/${stream.plannedCount} tiles recibidos.`
+    );
+
+    state.stream = null;
+    updateTileProgress();
 }
 
+function failDataStream(channel, message) {
+    console.error(`[${channel}] ${message}`);
+    const state = dataConnections.get(channel);
+    state.stream = null;
+    statusElement.textContent = `[${channel}] ${message}`;
+    updateTileProgress();
+}
+
+function clearDataStreamStates() {
+    for (const state of dataConnections.values()) {
+        state.stream = null;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// VIEWPORT / ZOOM / CACHE
+// -----------------------------------------------------------------------------
+
+zoomInButton.addEventListener("click", zoomIn);
+zoomOutButton.addEventListener("click", zoomOut);
+panUpButton.addEventListener("click", () => panBy(0, -1));
+panDownButton.addEventListener("click", () => panBy(0, 1));
+panLeftButton.addEventListener("click", () => panBy(-1, 0));
+panRightButton.addEventListener("click", () => panBy(1, 0));
+
 function requestViewport(zoom, currentX, currentY) {
-    if (!selectedImage || !rootSnapshot || !ensureSocketOpen()) {
+    if (!selectedImage || !rootSnapshot || !ensureControlOpen()) {
         return;
     }
 
@@ -567,7 +696,6 @@ function requestViewport(zoom, currentX, currentY) {
     currentX = clamp(currentX, 0, maxStart);
     currentY = clamp(currentY, 0, maxStart);
 
-    const previousViewId = currentView.viewId;
     const viewId = String(nextViewId++);
     currentView = { zoom, currentX, currentY, viewId };
 
@@ -580,16 +708,12 @@ function requestViewport(zoom, currentX, currentY) {
     drawCurrentViewportFromCache();
 
     const message = `VIEWPORT ${viewId} ${selectedImage.id} ${zoom} ${currentX} ${currentY}`;
-    socket.send(message);
+    controlSocket.send(message);
 
     viewerTitle.textContent = `${selectedImage.name} - nivel ${zoom}`;
     statusElement.textContent = `Enviado: ${message}`;
     rootProgress.textContent =
         `Vista ${viewId}: nivel ${zoom}, ventana 4×4 desde tile (${currentX}, ${currentY}).`;
-
-    // No hace falta CANCEL entre vistas: el servidor reemplaza automáticamente
-    // la cola pendiente al recibir el VIEWPORT nuevo.
-    void previousViewId;
 
     updateNavigationControls();
     updateTileProgress();
@@ -612,8 +736,6 @@ function zoomIn() {
     const targetTiles = tilesPerAxis(selectedImage, targetZoom);
     const maxStart = targetTiles - VIEWPORT_TILES;
 
-    // Coincide con el grupo D prefetched por el servidor: los cuatro tiles
-    // centrales de la vista actual producen un 4x4 del siguiente nivel.
     const nextX = clamp(2 * (currentView.currentX + 1), 0, maxStart);
     const nextY = clamp(2 * (currentView.currentY + 1), 0, maxStart);
     requestViewport(targetZoom, nextX, nextY);
@@ -626,8 +748,8 @@ function zoomOut() {
 
     if (currentView.zoom === 1) {
         const oldViewId = currentView.viewId;
-        if (oldViewId && ensureSocketOpen(false)) {
-            socket.send(`CANCEL ${oldViewId}`);
+        if (oldViewId && ensureControlOpen(false)) {
+            controlSocket.send(`CANCEL ${oldViewId}`);
         }
 
         desiredTileKeys = new Set();
@@ -642,7 +764,6 @@ function zoomOut() {
     const previousTiles = tilesPerAxis(selectedImage, targetZoom);
     const maxStart = previousTiles - VIEWPORT_TILES;
 
-    // Misma fórmula co-centrada usada por el grupo C del servidor.
     const centerX = currentView.currentX * TILE_SIZE + VIEWPORT_PIXELS / 2;
     const centerY = currentView.currentY * TILE_SIZE + VIEWPORT_PIXELS / 2;
     const previousCenterX = centerX / 2;
@@ -697,7 +818,7 @@ function planDesiredTileKeys(image, zoom, currentX, currentY) {
         }
     }
 
-    // B: 16 vecinos (hasta 4 por lado, sin esquinas).
+    // B: hasta 16 vecinos del mismo nivel.
     for (let x = currentX; x < currentX + VIEWPORT_TILES; x++) {
         add(zoom, x, currentY - 1, currentTiles);
         add(zoom, x, currentY + VIEWPORT_TILES, currentTiles);
@@ -707,7 +828,7 @@ function planDesiredTileKeys(image, zoom, currentX, currentY) {
         add(zoom, currentX + VIEWPORT_TILES, y, currentTiles);
     }
 
-    // D: 16 centrales del nivel siguiente.
+    // D: 16 del nivel siguiente.
     if (zoom < image.maxZoom) {
         const nextTiles = tilesPerAxis(image, zoom + 1);
         const nextX = 2 * (currentX + 1);
@@ -720,7 +841,7 @@ function planDesiredTileKeys(image, zoom, currentX, currentY) {
         }
     }
 
-    // C: 16 co-centrados del nivel anterior; z=1 usa ROOT.
+    // C: 16 co-centrados del nivel anterior. z=1 usa ROOT.
     if (zoom > 1) {
         const previousTiles = tilesPerAxis(image, zoom - 1);
         const centerX = currentX * TILE_SIZE + VIEWPORT_PIXELS / 2;
@@ -753,16 +874,20 @@ function evictTilesOutsideDesiredSet() {
         }
 
         tileCache.delete(key);
-        if (ensureSocketOpen(false)) {
-            socket.send(`TILE_EVICT ${tile.imageId} ${tile.zoom} ${tile.tileX} ${tile.tileY}`);
+        if (ensureControlOpen(false)) {
+            controlSocket.send(
+                `TILE_EVICT ${tile.imageId} ${tile.zoom} ${tile.tileX} ${tile.tileY}`
+            );
         }
     }
 }
 
 function clearTileCache(notifyServer) {
-    if (notifyServer && ensureSocketOpen(false)) {
+    if (notifyServer && ensureControlOpen(false)) {
         for (const tile of tileCache.values()) {
-            socket.send(`TILE_EVICT ${tile.imageId} ${tile.zoom} ${tile.tileX} ${tile.tileY}`);
+            controlSocket.send(
+                `TILE_EVICT ${tile.imageId} ${tile.zoom} ${tile.tileX} ${tile.tileY}`
+            );
         }
     }
     tileCache.clear();
@@ -814,7 +939,7 @@ function drawTileAt(tile, destinationX, destinationY) {
 }
 
 // -----------------------------------------------------------------------------
-// Formatos de píxel
+// FORMATOS DE PÍXEL
 // -----------------------------------------------------------------------------
 
 function bytesPerPixelForFormat(format) {
@@ -870,7 +995,7 @@ function decodePixelBuffer(buffer, width, height, format) {
 }
 
 // -----------------------------------------------------------------------------
-// UI / utilidades
+// UI / UTILIDADES
 // -----------------------------------------------------------------------------
 
 function parseImageLine(line) {
@@ -981,8 +1106,7 @@ function updateNavigationControls() {
 
 function updateTileProgress() {
     if (!selectedImage || currentView.zoom === 0) {
-        tileProgress.textContent =
-            `ROOT local. Cache de tiles: ${tileCache.size}.`;
+        tileProgress.textContent = `ROOT local. Cache de tiles: ${tileCache.size}.`;
         return;
     }
 
@@ -1008,10 +1132,17 @@ function updateTileProgress() {
         }
     }
 
+    const streams = DATA_CHANNELS.map(channel => {
+        const stream = dataConnections.get(channel).stream;
+        return stream
+            ? `${channel}:${stream.receivedCount}/${stream.plannedCount}`
+            : `${channel}:-`;
+    }).join(" | ");
+
     tileProgress.textContent =
         `Visibles: ${visibleReady}/16 | ` +
         `cache deseada: ${desiredReady}/${desiredTileKeys.size} | ` +
-        `tiles almacenados: ${tileCache.size}`;
+        `tiles almacenados: ${tileCache.size} | ${streams}`;
 }
 
 function disableNavigation() {
@@ -1024,10 +1155,10 @@ function disableNavigation() {
     panRightButton.disabled = true;
 }
 
-function ensureSocketOpen(showMessage = true) {
-    if (socket.readyState !== WebSocket.OPEN) {
+function ensureControlOpen(showMessage = true) {
+    if (controlSocket.readyState !== WebSocket.OPEN || !sessionId) {
         if (showMessage) {
-            statusElement.textContent = "El WebSocket todavía no está listo.";
+            statusElement.textContent = "La conexión CONTROL todavía no está lista.";
         }
         return false;
     }
@@ -1053,13 +1184,6 @@ function failRoot(message) {
     currentRootButton = null;
 }
 
-function failTile(message) {
-    console.error(message);
-    statusElement.textContent = message;
-    tileReception = null;
-    updateTileProgress();
-}
-
 function handleError(message, header) {
     statusElement.textContent = message;
 
@@ -1073,3 +1197,5 @@ function handleError(message, header) {
 function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
 }
+
+updateChannelStatus();

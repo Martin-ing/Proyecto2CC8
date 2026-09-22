@@ -14,6 +14,8 @@ import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class ImageServer {
     private static final String WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -22,6 +24,7 @@ public class ImageServer {
     private final int port;
     private final ImageCatalog imageCatalog;
     private final RootStreamer rootStreamer;
+    private final Map<String, ClientSession> sessions = new ConcurrentHashMap<>();
 
     public ImageServer(int port, Path imagesDirectory) {
         this.port = port;
@@ -33,6 +36,7 @@ public class ImageServer {
         try (ServerSocket serverSocket = new ServerSocket(port)) {
             System.out.println("Servidor de protocolo iniciado en puerto " + port);
             System.out.println("WebSocket disponible en ws://localhost:" + port + "/ws");
+            System.out.println("Esquema: 1 CONTROL + 3 canales de datos (CURRENT/PREVIOUS/NEXT)");
             System.out.println("Esperando clientes...");
 
             while (true) {
@@ -56,14 +60,13 @@ public class ImageServer {
 
             if (isWebSocketUpgrade(request) && "/ws".equals(request.path())) {
                 performWebSocketHandshake(request, output);
-                System.out.println("[WS] Cliente conectado: " + remote);
-                handleProtocol(new WebSocketConnection(input, output));
-                System.out.println("[WS] Cliente desconectado: " + remote);
+                WebSocketConnection connection = new WebSocketConnection(input, output);
+                System.out.println("[WS] Conexión abierta: " + remote);
+                routeWebSocket(connection, remote);
+                System.out.println("[WS] Conexión cerrada: " + remote);
                 return;
             }
 
-            // Este servidor ya no entrega index.html, JS ni CSS.
-            // Solo acepta conexiones WebSocket para el protocolo de imágenes.
             sendPlainResponse(
                     output,
                     426,
@@ -75,42 +78,119 @@ public class ImageServer {
         }
     }
 
-    private void handleProtocol(WebSocketConnection connection) throws IOException {
-        ClientTileSession tileSession = new ClientTileSession(connection, imageCatalog);
-        tileSession.start();
+    /**
+     * El primer mensaje de cada WebSocket define su papel:
+     *   SESSION_OPEN
+     *   SESSION_JOIN <sessionId> <CURRENT|PREVIOUS|NEXT>
+     */
+    private void routeWebSocket(WebSocketConnection connection, String remote) throws IOException {
+        String firstMessage = connection.readTextMessage();
+        if (firstMessage == null) {
+            return;
+        }
+
+        firstMessage = firstMessage.trim();
+        System.out.println("[PROTOCOLO] Primer mensaje " + remote + ": " + firstMessage);
+        String[] parts = firstMessage.split("\\s+");
+
+        if (parts.length == 1 && "SESSION_OPEN".equals(parts[0])) {
+            handleControlConnection(connection);
+            return;
+        }
+
+        if (parts.length == 3 && "SESSION_JOIN".equals(parts[0])) {
+            handleDataConnection(connection, parts[1], parts[2]);
+            return;
+        }
+
+        connection.sendText(
+                "ERROR 0 SESSION_REQUIRED Primer mensaje esperado: SESSION_OPEN o "
+                        + "SESSION_JOIN <sessionId> <CURRENT|PREVIOUS|NEXT>"
+        );
+    }
+
+    private void handleControlConnection(WebSocketConnection connection) throws IOException {
+        String sessionId = UUID.randomUUID().toString();
+        ClientSession session = new ClientSession(sessionId, connection, imageCatalog);
+        sessions.put(sessionId, session);
+        session.start();
+
+        connection.sendText("SESSION_OK " + sessionId);
+        System.out.println("[SESSION] Creada " + sessionId);
 
         try {
             String message;
-
             while ((message = connection.readTextMessage()) != null) {
                 message = message.trim();
                 if (message.isEmpty()) {
                     continue;
                 }
 
-                System.out.println("[PROTOCOLO] Recibido: " + message);
+                System.out.println("[CONTROL " + sessionId + "] " + message);
                 String[] parts = message.split("\\s+");
                 String command = parts[0];
 
                 if ("ARCHIVOS".equals(command)) {
                     handleArchivos(parts, connection);
                 } else if ("ROOT".equals(command)) {
-                    handleRoot(parts, connection, tileSession);
+                    handleRoot(parts, connection, session);
                 } else if ("VIEWPORT".equals(command)) {
-                    tileSession.handleViewport(parts);
+                    session.handleViewport(parts);
                 } else if ("TILE_ACK".equals(command)) {
-                    tileSession.handleTileAck(parts);
+                    session.handleTileAck(parts);
                 } else if ("TILE_EVICT".equals(command)) {
-                    tileSession.handleTileEvict(parts);
+                    session.handleTileEvict(parts);
                 } else if ("CANCEL".equals(command)) {
-                    tileSession.handleCancel(parts);
+                    session.handleCancel(parts);
                 } else {
                     String requestId = parts.length > 1 ? parts[1] : "0";
-                    connection.sendText("ERROR " + requestId + " UNKNOWN_COMMAND Comando no soportado");
+                    connection.sendText(
+                            "ERROR " + requestId + " UNKNOWN_COMMAND Comando no soportado en CONTROL"
+                    );
                 }
             }
         } finally {
-            tileSession.close();
+            sessions.remove(sessionId, session);
+            session.close();
+            System.out.println("[SESSION] Cerrada " + sessionId);
+        }
+    }
+
+    private void handleDataConnection(
+            WebSocketConnection connection,
+            String sessionId,
+            String channelText
+    ) throws IOException {
+        ClientSession session = sessions.get(sessionId);
+        if (session == null) {
+            connection.sendText("ERROR 0 SESSION_NOT_FOUND Sesión inexistente o cerrada");
+            return;
+        }
+
+        DataChannel channel = DataChannel.fromProtocol(channelText);
+        if (channel == null) {
+            connection.sendText(
+                    "ERROR 0 BAD_CHANNEL Canales soportados: CURRENT, PREVIOUS, NEXT"
+            );
+            return;
+        }
+
+        session.attachChannel(channel, connection);
+
+        try {
+            // Los canales de datos son server -> client. Este loop únicamente
+            // mantiene viva la conexión y procesa close/ping de WebSocket.
+            String unexpected;
+            while ((unexpected = connection.readTextMessage()) != null) {
+                unexpected = unexpected.trim();
+                if (!unexpected.isEmpty()) {
+                    connection.sendText(
+                            "ERROR 0 DATA_CHANNEL_READ_ONLY Usa la conexión CONTROL para comandos"
+                    );
+                }
+            }
+        } finally {
+            session.detachChannel(channel, connection);
         }
     }
 
@@ -154,7 +234,7 @@ public class ImageServer {
     private void handleRoot(
             String[] parts,
             WebSocketConnection connection,
-            ClientTileSession tileSession
+            ClientSession session
     ) throws IOException {
         if (parts.length != 4) {
             connection.sendText(
@@ -195,7 +275,7 @@ public class ImageServer {
                 return;
             }
 
-            tileSession.selectImage(imageId);
+            session.selectImage(imageId);
 
             System.out.println("[ROOT] Iniciando ROOT de " + imageId
                     + " en " + format.protocolName()

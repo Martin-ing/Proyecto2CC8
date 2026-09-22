@@ -25,6 +25,7 @@
         </label>
 
         <p id="status">Conectando con el servidor Java...</p>
+        <p id="channelStatus" class="channel-status">CONTROL: ... | CURRENT: ... | PREVIOUS: ... | NEXT: ...</p>
 
         <section>
             <h2>Imágenes disponibles</h2>
@@ -55,8 +56,7 @@
 
                 <p id="tileProgress"></p>
                 <p class="hint">
-                    El desplazamiento mueve la ventana un tile (256 px). Los tiles se
-                    transmiten en RGBA4444; ROOT conserva el formato seleccionado arriba.
+                    El desplazamiento mueve la ventana un tile (256 px). Los tiles se transmiten en RGBA4444. CURRENT, PREVIOUS y NEXT viajan por tres conexiones WebSocket de datos independientes; ROOT y los mensajes de control usan CONTROL.
                 </p>
             </div>
 

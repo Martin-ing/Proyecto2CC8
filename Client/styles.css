@@ -127,3 +127,9 @@ button:disabled {
     padding: 8px;
     font-size: 15px;
 }
+
+.channel-status {
+    font-family: Consolas, monospace;
+    font-size: 14px;
+    color: #555;
+}

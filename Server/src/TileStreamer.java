@@ -3,22 +3,49 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.file.Files;
 import java.util.Arrays;
+import java.util.List;
+import java.util.function.BooleanSupplier;
 
+/**
+ * Transmite un conjunto de tiles de un mismo nivel como un único stream lógico.
+ *
+ * Framing:
+ *   TILE_STREAM_START ... <count> <x1,y1> <x2,y2> ...
+ *   <frame binario de 128 KiB: tile 1 completo>
+ *   <frame binario de 128 KiB: tile 2 completo>
+ *   ...
+ *   TILE_STREAM_END <streamId> <sentCount>
+ *
+ * El buffer de 128 KiB se reutiliza para todos los tiles; nunca se acumula el
+ * stream completo en RAM.
+ */
 public class TileStreamer {
     private static final int RAW_BYTES_PER_PIXEL = 4;
-    private static final int CHUNK_SIZE = 64 * 1024;
     private static final PixelFormat TILE_FORMAT = PixelFormat.RGBA4444;
 
-    public void stream(
-            String tileRequestId,
+    public int stream(
+            String streamId,
             String viewId,
             ImageMeta image,
-            TileId tile,
-            WebSocketConnection connection
+            DataChannel channel,
+            List<TileId> tiles,
+            WebSocketConnection connection,
+            BooleanSupplier shouldContinue
     ) throws IOException {
-        ImageLevel level = image.level(tile.zoom());
+        if (tiles.isEmpty()) {
+            return 0;
+        }
+
+        int zoom = tiles.getFirst().zoom();
+        for (TileId tile : tiles) {
+            if (tile.zoom() != zoom || !tile.imageId().equals(image.id())) {
+                throw new IOException("Todos los tiles de un stream deben pertenecer a la misma imagen y nivel");
+            }
+        }
+
+        ImageLevel level = image.level(zoom);
         if (level == null) {
-            throw new IOException("No existe level." + tile.zoom());
+            throw new IOException("No existe level." + zoom);
         }
 
         int tileSize = image.tileSize();
@@ -27,104 +54,113 @@ public class TileStreamer {
         }
 
         int tilesPerAxis = level.virtualSize() / tileSize;
-        if (tile.tileX() < 0 || tile.tileY() < 0
-                || tile.tileX() >= tilesPerAxis || tile.tileY() >= tilesPerAxis) {
-            throw new IOException("Tile fuera de rango: " + tile);
+        for (TileId tile : tiles) {
+            if (tile.tileX() < 0 || tile.tileY() < 0
+                    || tile.tileX() >= tilesPerAxis || tile.tileY() >= tilesPerAxis) {
+                throw new IOException("Tile fuera de rango: " + tile);
+            }
         }
 
         long expectedRawBytes = (long) level.width() * level.height() * RAW_BYTES_PER_PIXEL;
         long actualRawBytes = Files.size(level.rawPath());
         if (actualRawBytes < expectedRawBytes) {
-            throw new IOException("RAW incompleto para " + tile + ": se esperaban al menos "
+            throw new IOException("RAW incompleto para level." + zoom + ": se esperaban al menos "
                     + expectedRawBytes + " bytes y hay " + actualRawBytes);
         }
 
-        int outputBytesPerPixel = TILE_FORMAT.bytesPerPixel();
-        int bytesPerTileRow = tileSize * outputBytesPerPixel;
-        if (CHUNK_SIZE % bytesPerTileRow != 0) {
-            throw new IOException("chunkSize no contiene un número entero de filas del tile");
-        }
-
-        int rowsPerChunk = CHUNK_SIZE / bytesPerTileRow;
-        int tileBytes = tileSize * tileSize * outputBytesPerPixel;
-        int chunkCount = (tileBytes + CHUNK_SIZE - 1) / CHUNK_SIZE;
-
-        byte[] chunk = new byte[CHUNK_SIZE];
+        int tileBytes = tileSize * tileSize * TILE_FORMAT.bytesPerPixel();
+        byte[] tileBuffer = new byte[tileBytes];
         byte[] rawSpan = new byte[tileSize * RAW_BYTES_PER_PIXEL];
 
-        // Bloqueamos la secuencia completa TILE_START/DATA/binario/END para que
-        // no se intercale con ROOT u otro envío de la misma conexión.
-        synchronized (connection) {
-            connection.sendText(
-                    "TILE_START " + tileRequestId
-                            + " " + viewId
-                            + " " + image.id()
-                            + " " + tile.zoom()
-                            + " " + tile.tileX()
-                            + " " + tile.tileY()
-                            + " " + tileSize
-                            + " " + tileSize
-                            + " " + TILE_FORMAT.protocolName()
-                            + " " + CHUNK_SIZE
-                            + " " + chunkCount
-            );
+        StringBuilder start = new StringBuilder();
+        start.append("TILE_STREAM_START ")
+                .append(streamId).append(' ')
+                .append(viewId).append(' ')
+                .append(image.id()).append(' ')
+                .append(channel.name()).append(' ')
+                .append(zoom).append(' ')
+                .append(TILE_FORMAT.protocolName()).append(' ')
+                .append(tileSize).append(' ')
+                .append(tileBytes).append(' ')
+                .append(tiles.size());
 
-            try (RandomAccessFile raw = new RandomAccessFile(level.rawPath().toFile(), "r")) {
-                for (int chunkIndex = 0; chunkIndex < chunkCount; chunkIndex++) {
-                    Arrays.fill(chunk, (byte) 0);
+        for (TileId tile : tiles) {
+            start.append(' ')
+                    .append(tile.tileX())
+                    .append(',')
+                    .append(tile.tileY());
+        }
 
-                    int startTileRow = chunkIndex * rowsPerChunk;
-                    int rowsThisChunk = Math.min(rowsPerChunk, tileSize - startTileRow);
+        connection.sendText(start.toString());
 
-                    for (int localRow = 0; localRow < rowsThisChunk; localRow++) {
-                        int tileRow = startTileRow + localRow;
-                        int virtualY = tile.tileY() * tileSize + tileRow;
-                        int realY = virtualY - level.offsetY();
-
-                        if (realY < 0 || realY >= level.height()) {
-                            continue;
-                        }
-
-                        int virtualStartX = tile.tileX() * tileSize;
-                        int realStartX = Math.max(0, virtualStartX - level.offsetX());
-                        int realEndX = Math.min(
-                                level.width(),
-                                virtualStartX + tileSize - level.offsetX()
-                        );
-
-                        int pixelsToRead = realEndX - realStartX;
-                        if (pixelsToRead <= 0) {
-                            continue;
-                        }
-
-                        long byteOffset = ((long) realY * level.width() + realStartX)
-                                * RAW_BYTES_PER_PIXEL;
-                        raw.seek(byteOffset);
-
-                        int bytesToRead = pixelsToRead * RAW_BYTES_PER_PIXEL;
-                        readFully(raw, rawSpan, bytesToRead);
-
-                        int firstVirtualX = level.offsetX() + realStartX;
-                        int destinationStartX = firstVirtualX - virtualStartX;
-                        int destinationRowOffset = localRow * bytesPerTileRow;
-
-                        convertSpanToRgba4444(
-                                rawSpan,
-                                pixelsToRead,
-                                chunk,
-                                destinationRowOffset + destinationStartX * outputBytesPerPixel
-                        );
-                    }
-
-                    int dataLength = Math.min(CHUNK_SIZE, tileBytes - chunkIndex * CHUNK_SIZE);
-                    connection.sendText(
-                            "TILE_DATA " + tileRequestId + " " + chunkIndex + " " + dataLength
-                    );
-                    connection.sendBinary(chunk, 0, dataLength);
+        int sentCount = 0;
+        try (RandomAccessFile raw = new RandomAccessFile(level.rawPath().toFile(), "r")) {
+            for (TileId tile : tiles) {
+                if (!shouldContinue.getAsBoolean()) {
+                    break;
                 }
+
+                fillTile(raw, image, level, tile, tileBuffer, rawSpan);
+                connection.sendBinary(tileBuffer);
+                sentCount++;
+            }
+        }
+
+        connection.sendText("TILE_STREAM_END " + streamId + " " + sentCount);
+        return sentCount;
+    }
+
+    private static void fillTile(
+            RandomAccessFile raw,
+            ImageMeta image,
+            ImageLevel level,
+            TileId tile,
+            byte[] destination,
+            byte[] rawSpan
+    ) throws IOException {
+        Arrays.fill(destination, (byte) 0);
+
+        int tileSize = image.tileSize();
+        int outputBytesPerPixel = TILE_FORMAT.bytesPerPixel();
+        int bytesPerTileRow = tileSize * outputBytesPerPixel;
+        int virtualStartX = tile.tileX() * tileSize;
+
+        for (int tileRow = 0; tileRow < tileSize; tileRow++) {
+            int virtualY = tile.tileY() * tileSize + tileRow;
+            int realY = virtualY - level.offsetY();
+
+            if (realY < 0 || realY >= level.height()) {
+                continue;
             }
 
-            connection.sendText("TILE_END " + tileRequestId);
+            int realStartX = Math.max(0, virtualStartX - level.offsetX());
+            int realEndX = Math.min(
+                    level.width(),
+                    virtualStartX + tileSize - level.offsetX()
+            );
+
+            int pixelsToRead = realEndX - realStartX;
+            if (pixelsToRead <= 0) {
+                continue;
+            }
+
+            long byteOffset = ((long) realY * level.width() + realStartX)
+                    * RAW_BYTES_PER_PIXEL;
+            raw.seek(byteOffset);
+
+            int bytesToRead = pixelsToRead * RAW_BYTES_PER_PIXEL;
+            readFully(raw, rawSpan, bytesToRead);
+
+            int firstVirtualX = level.offsetX() + realStartX;
+            int destinationStartX = firstVirtualX - virtualStartX;
+            int destinationRowOffset = tileRow * bytesPerTileRow;
+
+            convertSpanToRgba4444(
+                    rawSpan,
+                    pixelsToRead,
+                    destination,
+                    destinationRowOffset + destinationStartX * outputBytesPerPixel
+            );
         }
     }
 
