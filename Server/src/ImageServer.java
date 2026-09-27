@@ -24,12 +24,14 @@ public class ImageServer {
     private final int port;
     private final ImageCatalog imageCatalog;
     private final RootStreamer rootStreamer;
+    private final GlobalImageCache imageCache;
     private final Map<String, ClientSession> sessions = new ConcurrentHashMap<>();
 
     public ImageServer(int port, Path imagesDirectory) {
         this.port = port;
         this.imageCatalog = new ImageCatalog(imagesDirectory);
-        this.rootStreamer = new RootStreamer();
+        this.imageCache = GlobalImageCache.configured();
+        this.rootStreamer = new RootStreamer(imageCache);
     }
 
     public void start() throws IOException {
@@ -37,6 +39,7 @@ public class ImageServer {
             System.out.println("Servidor de protocolo iniciado en puerto " + port);
             System.out.println("WebSocket disponible en ws://localhost:" + port + "/ws");
             System.out.println("Esquema: 1 CONTROL + 3 canales de datos (CURRENT/PREVIOUS/NEXT)");
+            System.out.println("[CACHE GLOBAL] " + imageCache.stats());
             System.out.println("Esperando clientes...");
 
             while (true) {
@@ -111,7 +114,7 @@ public class ImageServer {
 
     private void handleControlConnection(WebSocketConnection connection) throws IOException {
         String sessionId = UUID.randomUUID().toString();
-        ClientSession session = new ClientSession(sessionId, connection, imageCatalog);
+        ClientSession session = new ClientSession(sessionId, connection, imageCatalog, imageCache);
         sessions.put(sessionId, session);
         session.start();
 
@@ -153,6 +156,7 @@ public class ImageServer {
             sessions.remove(sessionId, session);
             session.close();
             System.out.println("[SESSION] Cerrada " + sessionId);
+            System.out.println("[CACHE GLOBAL] " + imageCache.stats());
         }
     }
 

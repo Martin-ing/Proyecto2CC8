@@ -1,12 +1,13 @@
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.RandomAccessFile;
-import java.nio.file.Files;
-import java.util.Arrays;
 
 public class RootStreamer {
     private static final int BYTES_PER_RGBA8888_PIXEL = 4;
     private static final int CHUNK_SIZE = 64 * 1024;
+    private final GlobalImageCache cache;
+
+    public RootStreamer(GlobalImageCache cache) { this.cache = cache; }
 
     public void stream(
             String requestId,
@@ -30,7 +31,8 @@ public class RootStreamer {
                 * level.height()
                 * BYTES_PER_RGBA8888_PIXEL;
 
-        long actualRawBytes = Files.size(level.rawPath());
+        ImageCacheKey.SourceVersion source = ImageCacheKey.SourceVersion.capture(level.rawPath());
+        long actualRawBytes = source.size();
         if (actualRawBytes < expectedRawBytes) {
             throw new IOException("RAW incompleto: se esperaban al menos " + expectedRawBytes
                     + " bytes y hay " + actualRawBytes);
@@ -70,61 +72,49 @@ public class RootStreamer {
                             + " " + CHUNK_SIZE + " " + chunkCount
             );
 
-            byte[] chunk = new byte[CHUNK_SIZE];
-            byte[] rawRow = new byte[level.width() * BYTES_PER_RGBA8888_PIXEL];
-
-            try (RandomAccessFile raw = new RandomAccessFile(level.rawPath().toFile(), "r")) {
             for (int chunkIndex = 0; chunkIndex < chunkCount; chunkIndex++) {
-                Arrays.fill(chunk, (byte) 0);
-
-                int startVirtualY = chunkIndex * rowsPerChunk;
-                int rowsInThisChunk = Math.min(rowsPerChunk, rootSize - startVirtualY);
-
-                for (int localRow = 0; localRow < rowsInThisChunk; localRow++) {
-                    int virtualY = startVirtualY + localRow;
-                    int realY = virtualY - level.offsetY();
-
-                    if (realY < 0 || realY >= level.height()) {
-                        continue;
-                    }
-
-                    long rowOffset = (long) realY
-                            * level.width()
-                            * BYTES_PER_RGBA8888_PIXEL;
-                    raw.seek(rowOffset);
-                    readFully(raw, rawRow);
-
-                    int destinationRowOffset = localRow * bytesPerVirtualRow;
-
-                    if (format == PixelFormat.RGBA8888) {
-                        copyRgba8888Row(
-                                rawRow,
-                                chunk,
-                                destinationRowOffset,
-                                level,
-                                rootSize
-                        );
-                    } else {
-                        convertRowToRgba4444(
-                                rawRow,
-                                chunk,
-                                destinationRowOffset,
-                                level,
-                                rootSize
-                        );
-                    }
-                }
-
-                int dataLength = Math.min(CHUNK_SIZE, rootBytes - chunkIndex * CHUNK_SIZE);
+                int index = chunkIndex;
+                int dataLength = Math.min(CHUNK_SIZE, rootBytes - index * CHUNK_SIZE);
+                ImageCacheKey key = ImageCacheKey.of(image, level, source, format,
+                        "ROOT_CHUNK", index, 0, dataLength);
+                GlobalImageCache.Payload payload = cache.getOrLoad(key, () ->
+                        buildChunk(level, source, format, rootSize, rowsPerChunk,
+                                bytesPerVirtualRow, index, dataLength));
                 connection.sendText(
-                        "ROOT_DATA " + requestId + " " + chunkIndex + " " + dataLength
+                        "ROOT_DATA " + requestId + " " + index + " " + dataLength
                 );
-                connection.sendBinary(chunk, 0, dataLength);
-            }
+                payload.sendTo(connection);
             }
 
             connection.sendText("ROOT_END " + requestId);
         }
+    }
+
+    private static byte[] buildChunk(
+            ImageLevel level, ImageCacheKey.SourceVersion source, PixelFormat format,
+            int rootSize, int rowsPerChunk, int bytesPerVirtualRow, int index, int length
+    ) throws IOException {
+        source.verifyUnchanged();
+        byte[] chunk = new byte[length];
+        byte[] rawRow = new byte[level.width() * BYTES_PER_RGBA8888_PIXEL];
+        int startVirtualY = index * rowsPerChunk;
+        int rows = Math.min(rowsPerChunk, rootSize - startVirtualY);
+        try (RandomAccessFile raw = new RandomAccessFile(source.path().toFile(), "r")) {
+            for (int localRow = 0; localRow < rows; localRow++) {
+                int realY = startVirtualY + localRow - level.offsetY();
+                if (realY < 0 || realY >= level.height()) continue;
+                raw.seek((long) realY * level.width() * BYTES_PER_RGBA8888_PIXEL);
+                readFully(raw, rawRow);
+                int destinationOffset = localRow * bytesPerVirtualRow;
+                if (format == PixelFormat.RGBA8888) {
+                    copyRgba8888Row(rawRow, chunk, destinationOffset, level, rootSize);
+                } else {
+                    convertRowToRgba4444(rawRow, chunk, destinationOffset, level, rootSize);
+                }
+            }
+        }
+        source.verifyUnchanged();
+        return chunk;
     }
 
     private static void copyRgba8888Row(

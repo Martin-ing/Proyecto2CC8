@@ -27,6 +27,44 @@ export function cameraForView(image, view) {
   };
 }
 
+export function clampCamera(image, zoom, camera) {
+  const size = zoom === 0 ? levelVirtualSize(image, 0) : VIEWPORT_PIXELS / 2 ** zoom;
+  const max = Math.max(0, levelVirtualSize(image, 0) - size);
+  return { x: clamp(camera.x, 0, max), y: clamp(camera.y, 0, max), size };
+}
+
+// Las posiciones antiguas son los centros de las celdas de navegación.
+// El centro visual puede separarse hasta medio tile de cada centro discreto.
+// La frontera 2.5 pertenece a la posición 3; 2.499... todavía pertenece a 2.
+export function viewForCamera(image, zoom, camera) {
+  if (zoom === 0) return { zoom: 0, currentX: 0, currentY: 0 };
+  const step = TILE_SIZE / 2 ** zoom;
+  const maxStart = Math.max(0, tilesPerAxis(image, zoom) - VIEWPORT_TILES);
+  return {
+    zoom,
+    currentX: clamp(Math.floor(camera.x / step + 0.5), 0, maxStart),
+    currentY: clamp(Math.floor(camera.y / step + 0.5), 0, maxStart),
+  };
+}
+
+// Una ventana 4x4 fraccional puede intersectar 5x5 tiles. Se cuenta la
+// cobertura real sin ampliar el plan de solicitudes del servidor.
+export function cameraTileKeys(image, zoom, camera) {
+  if (!image || !camera || zoom === 0) return [];
+  const step = TILE_SIZE / 2 ** zoom;
+  const max = tilesPerAxis(image, zoom) - 1;
+  const epsilon = 1e-9;
+  const firstX = Math.max(0, Math.floor(camera.x / step + epsilon));
+  const firstY = Math.max(0, Math.floor(camera.y / step + epsilon));
+  const lastX = Math.min(max, Math.ceil((camera.x + camera.size) / step - epsilon) - 1);
+  const lastY = Math.min(max, Math.ceil((camera.y + camera.size) / step - epsilon) - 1);
+  const keys = [];
+  for (let y = firstY; y <= lastY; y++) {
+    for (let x = firstX; x <= lastX; x++) keys.push(tileKey(image.id, zoom, x, y));
+  }
+  return keys;
+}
+
 export function tileWorldRect(tile) {
   const scale = 2 ** tile.zoom;
   return {

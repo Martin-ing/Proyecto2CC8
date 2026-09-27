@@ -18,6 +18,7 @@ public class ClientSession implements AutoCloseable {
     private final String sessionId;
     private final WebSocketConnection control;
     private final ImageCatalog imageCatalog;
+    private final GlobalImageCache imageCache;
     private final TilePlanner planner = new TilePlanner();
 
     private final Object stateLock = new Object();
@@ -34,11 +35,13 @@ public class ClientSession implements AutoCloseable {
     public ClientSession(
             String sessionId,
             WebSocketConnection control,
-            ImageCatalog imageCatalog
+            ImageCatalog imageCatalog,
+            GlobalImageCache imageCache
     ) {
         this.sessionId = sessionId;
         this.control = control;
         this.imageCatalog = imageCatalog;
+        this.imageCache = imageCache;
 
         for (DataChannel channel : DataChannel.values()) {
             workers.put(channel, new DataWorker(channel));
@@ -319,7 +322,7 @@ public class ClientSession implements AutoCloseable {
 
     private final class DataWorker implements AutoCloseable {
         private final DataChannel channel;
-        private final TileStreamer streamer = new TileStreamer();
+        private final TileStreamer streamer = new TileStreamer(imageCache);
         private final Object lock = new Object();
 
         private WebSocketConnection connection;

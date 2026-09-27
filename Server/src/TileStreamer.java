@@ -1,7 +1,6 @@
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.RandomAccessFile;
-import java.nio.file.Files;
 import java.util.Arrays;
 import java.util.List;
 import java.util.function.BooleanSupplier;
@@ -16,12 +15,15 @@ import java.util.function.BooleanSupplier;
  *   ...
  *   TILE_STREAM_END <streamId> <sentCount>
  *
- * El buffer de 128 KiB se reutiliza para todos los tiles; nunca se acumula el
- * stream completo en RAM.
+ * Los tiles preparados se reutilizan mediante la caché global. Nunca se
+ * acumula un stream completo por usuario en RAM.
  */
 public class TileStreamer {
     private static final int RAW_BYTES_PER_PIXEL = 4;
     private static final PixelFormat TILE_FORMAT = PixelFormat.RGBA4444;
+    private final GlobalImageCache cache;
+
+    public TileStreamer(GlobalImageCache cache) { this.cache = cache; }
 
     public int stream(
             String streamId,
@@ -62,15 +64,14 @@ public class TileStreamer {
         }
 
         long expectedRawBytes = (long) level.width() * level.height() * RAW_BYTES_PER_PIXEL;
-        long actualRawBytes = Files.size(level.rawPath());
+        ImageCacheKey.SourceVersion source = ImageCacheKey.SourceVersion.capture(level.rawPath());
+        long actualRawBytes = source.size();
         if (actualRawBytes < expectedRawBytes) {
             throw new IOException("RAW incompleto para level." + zoom + ": se esperaban al menos "
                     + expectedRawBytes + " bytes y hay " + actualRawBytes);
         }
 
         int tileBytes = tileSize * tileSize * TILE_FORMAT.bytesPerPixel();
-        byte[] tileBuffer = new byte[tileBytes];
-        byte[] rawSpan = new byte[tileSize * RAW_BYTES_PER_PIXEL];
 
         StringBuilder start = new StringBuilder();
         start.append("TILE_STREAM_START ")
@@ -94,16 +95,25 @@ public class TileStreamer {
         connection.sendText(start.toString());
 
         int sentCount = 0;
-        try (RandomAccessFile raw = new RandomAccessFile(level.rawPath().toFile(), "r")) {
-            for (TileId tile : tiles) {
-                if (!shouldContinue.getAsBoolean()) {
-                    break;
-                }
-
-                fillTile(raw, image, level, tile, tileBuffer, rawSpan);
-                connection.sendBinary(tileBuffer);
-                sentCount++;
+        for (TileId tile : tiles) {
+            if (!shouldContinue.getAsBoolean()) {
+                break;
             }
+
+            ImageCacheKey key = ImageCacheKey.of(image, level, source, TILE_FORMAT,
+                    "TILE", tile.tileX(), tile.tileY(), tileBytes);
+            GlobalImageCache.Payload payload = cache.getOrLoad(key, () -> {
+                source.verifyUnchanged();
+                byte[] tileBuffer = new byte[tileBytes];
+                byte[] rawSpan = new byte[tileSize * RAW_BYTES_PER_PIXEL];
+                try (RandomAccessFile raw = new RandomAccessFile(source.path().toFile(), "r")) {
+                    fillTile(raw, image, level, tile, tileBuffer, rawSpan);
+                }
+                source.verifyUnchanged();
+                return tileBuffer;
+            });
+            payload.sendTo(connection);
+            sentCount++;
         }
 
         connection.sendText("TILE_STREAM_END " + streamId + " " + sentCount);

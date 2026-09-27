@@ -3,6 +3,7 @@ import {
   tileWorldRect, projectRect, interpolateCamera, clamp, levelVirtualSize,
 } from './geometry.js';
 import { pixelSurface, releaseSurface } from './pixels.js';
+import { PanMotion } from './PanMotion.js';
 
 const MAX_DECODED_TILES = 64;
 
@@ -18,6 +19,7 @@ export class LayerRenderer {
     this.frame = null;
     this.targetSince = 0;
     this.decoded = new Map();
+    this.panMotion = new PanMotion();
   }
 
   attach(canvas) {
@@ -53,6 +55,7 @@ export class LayerRenderer {
   }
 
   moveTo(view, animate) {
+    this.panMotion.stop();
     const destination = cameraForView(this.client.selectedImage, view);
     if (animate && this.camera) {
       this.targetSince = performance.now();
@@ -66,13 +69,29 @@ export class LayerRenderer {
     this.requestDraw();
   }
 
+  startPan(view) {
+    this.panMotion.startStep(this.camera, cameraForView(this.client.selectedImage, view), view.zoom, performance.now());
+    this.requestDraw();
+  }
+
+  advancePan(now) {
+    if (this.animation || !this.camera || !this.panMotion.kind) return false;
+    const result = this.panMotion.advance(this.camera, now);
+    if (result.camera.x !== this.camera.x || result.camera.y !== this.camera.y) {
+      this.client.commitPanCamera(result.camera);
+    }
+    if (result.finished && result.kind === 'step') this.client.finishPan();
+    return result.moving;
+  }
+
   requestDraw() {
     if (this.frame !== null || !this.context) return;
     this.frame = requestAnimationFrame(now => {
       this.frame = null;
+      const panning = this.advancePan(now);
       const needsFrame = this.draw(now);
-      if (needsFrame) this.requestDraw();
-      else this.client.releaseCoveredFallback();
+      this.client.releaseCoveredFallback();
+      if (panning || needsFrame) this.requestDraw();
     });
   }
 
@@ -99,7 +118,12 @@ export class LayerRenderer {
     const r = projectRect(worldRect, this.camera);
     const ctx = this.context;
     ctx.save();
-    if (opacity >= 1) ctx.clearRect(r.x, r.y, r.width, r.height);
+    if (opacity >= 1) {
+      ctx.beginPath();
+      ctx.rect(r.x, r.y, r.width, r.height);
+      ctx.clip();
+      ctx.globalCompositeOperation = 'copy';
+    }
     ctx.globalAlpha = opacity;
     ctx.drawImage(surface, r.x, r.y, r.width, r.height);
     ctx.restore();
@@ -132,6 +156,7 @@ export class LayerRenderer {
     const drawTile = (key, tile, alpha = 1) => {
       const rect = tileWorldRect(tile);
       if (!this.isVisible(rect) || alpha <= 0) return;
+      this.client.tileCache.touch(key);
       this.paint(this.texture(key, tile), rect, alpha);
     };
     // 2. Prefetch del nivel inferior, en su escala real.
@@ -172,6 +197,7 @@ export class LayerRenderer {
     if (this.frame !== null) cancelAnimationFrame(this.frame);
     this.frame = null;
     this.animation = null;
+    this.panMotion.stop();
     this.camera = null;
     this.targetSince = 0;
     releaseSurface(this.root);
