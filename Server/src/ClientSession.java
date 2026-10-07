@@ -1,8 +1,10 @@
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.EnumMap;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -10,9 +12,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * Estado compartido por las cuatro conexiones WebSocket de un navegador:
  * CONTROL + CURRENT + PREVIOUS + NEXT.
  *
- * No implementa Reno todavía. Cada canal de datos tiene un worker independiente
- * y transmite su stream secuencialmente, mientras los tres canales pueden
- * trabajar en paralelo.
+ * Cada canal de datos tiene un worker independiente y transmite su stream
+ * secuencialmente, mientras los tres canales pueden trabajar en paralelo.
+ * Al liberar reservas se revisa la vista vigente para no perder tiles cuando
+ * cambian de canal durante un zoom. No añade un algoritmo de control de flujo.
  */
 public class ClientSession implements AutoCloseable {
     private final String sessionId;
@@ -23,7 +26,9 @@ public class ClientSession implements AutoCloseable {
 
     private final Object stateLock = new Object();
     private final Set<TileId> clientHas = new HashSet<>();
-    private final Set<TileId> inFlight = new HashSet<>();
+    // Cada reserva pertenece a un stream: su limpieza no puede borrar la de otro.
+    private final Map<TileId, String> inFlight = new HashMap<>();
+    private final EnumMap<DataChannel, StreamPlan> activePlans = new EnumMap<>(DataChannel.class);
     private final EnumMap<DataChannel, DataWorker> workers = new EnumMap<>(DataChannel.class);
     private final AtomicLong nextStreamId = new AtomicLong(1);
 
@@ -31,6 +36,7 @@ public class ClientSession implements AutoCloseable {
     private String selectedImageId;
     private ImageMeta selectedImage;
     private String currentViewId;
+    private boolean viewCompleteLogged;
 
     public ClientSession(
             String sessionId,
@@ -76,6 +82,8 @@ public class ClientSession implements AutoCloseable {
             selectedImageId = imageId;
             selectedImage = null;
             currentViewId = null;
+            activePlans.clear();
+            viewCompleteLogged = false;
             clientHas.clear();
             inFlight.clear();
         }
@@ -138,16 +146,6 @@ public class ClientSession implements AutoCloseable {
             return;
         }
 
-        synchronized (stateLock) {
-            if (!imageId.equals(selectedImageId)) {
-                selectedImageId = imageId;
-                clientHas.clear();
-                inFlight.clear();
-            }
-            selectedImage = image;
-            currentViewId = viewId;
-        }
-
         List<TileId> current = new ArrayList<>();
         List<TileId> previous = new ArrayList<>();
         List<TileId> next = new ArrayList<>();
@@ -161,15 +159,29 @@ public class ClientSession implements AutoCloseable {
             }
         }
 
-        workers.get(DataChannel.CURRENT).replacePlan(
-                new StreamPlan(viewId, image, current)
-        );
-        workers.get(DataChannel.PREVIOUS).replacePlan(
-                previous.isEmpty() ? null : new StreamPlan(viewId, image, previous)
-        );
-        workers.get(DataChannel.NEXT).replacePlan(
-                next.isEmpty() ? null : new StreamPlan(viewId, image, next)
-        );
+        var newPlans = new EnumMap<DataChannel, StreamPlan>(DataChannel.class);
+        if (!current.isEmpty()) newPlans.put(DataChannel.CURRENT, new StreamPlan(viewId, image, current));
+        if (!previous.isEmpty()) newPlans.put(DataChannel.PREVIOUS, new StreamPlan(viewId, image, previous));
+        if (!next.isEmpty()) newPlans.put(DataChannel.NEXT, new StreamPlan(viewId, image, next));
+
+        // Publicar los tres planes juntos antes de despertar workers. Una
+        // liberación de NEXT ya debe consultar el nuevo CURRENT (y viceversa).
+        synchronized (stateLock) {
+            if (!imageId.equals(selectedImageId)) {
+                selectedImageId = imageId;
+                clientHas.clear();
+                inFlight.clear();
+            }
+            selectedImage = image;
+            currentViewId = viewId;
+            activePlans.clear();
+            activePlans.putAll(newPlans);
+            viewCompleteLogged = false;
+            logViewCompleteIfReady();
+        }
+        for (DataChannel channel : DataChannel.values()) {
+            workers.get(channel).replacePlan(newPlans.get(channel));
+        }
 
         long actual = plan.stream().filter(p -> p.priority() == 1).count();
         long neighbors = plan.stream().filter(p -> p.priority() == 2).count();
@@ -205,6 +217,7 @@ public class ClientSession implements AutoCloseable {
             }
             inFlight.remove(tile);
             clientHas.add(tile);
+            logViewCompleteIfReady();
         }
         System.out.println("[TILE_ACK] session=" + sessionId + " " + tile);
     }
@@ -225,9 +238,14 @@ public class ClientSession implements AutoCloseable {
 
         synchronized (stateLock) {
             clientHas.remove(tile);
-            inFlight.remove(tile);
+            // EVICT describe la caché del navegador; no cancela un envío nuevo
+            // que ya tenga reservado este mismo tile en otro stream.
+            if (activePlans.values().stream().anyMatch(plan -> plan.tiles().contains(tile))) {
+                viewCompleteLogged = false;
+            }
         }
         System.out.println("[TILE_EVICT] session=" + sessionId + " " + tile);
+        rescheduleMissingTiles();
     }
 
     public void handleCancel(String[] parts) throws IOException {
@@ -242,6 +260,8 @@ public class ClientSession implements AutoCloseable {
             cancel = requestId.equals(currentViewId);
             if (cancel) {
                 currentViewId = null;
+                activePlans.clear();
+                viewCompleteLogged = false;
             }
         }
 
@@ -273,26 +293,60 @@ public class ClientSession implements AutoCloseable {
      * Reserva los tiles justo antes de anunciar TILE_STREAM_START. Esto evita
      * que dos canales paralelos anuncien/transmitan el mismo tile.
      */
-    private List<TileId> reserveTiles(List<TileId> candidates) {
+    private List<TileId> reserveTiles(DataChannel channel, StreamPlan plan, String streamId) {
         List<TileId> reserved = new ArrayList<>();
         synchronized (stateLock) {
-            for (TileId tile : candidates) {
-                if (clientHas.contains(tile) || inFlight.contains(tile)) {
+            // Un worker pudo tomar su plan justo antes de un VIEWPORT/CANCEL.
+            if (!running || activePlans.get(channel) != plan) return reserved;
+            for (TileId tile : plan.tiles()) {
+                if (clientHas.contains(tile) || inFlight.containsKey(tile)) {
                     continue;
                 }
-                inFlight.add(tile);
+                inFlight.put(tile, streamId);
                 reserved.add(tile);
             }
         }
         return reserved;
     }
 
-    private void releaseReservations(List<TileId> tiles, int fromIndex) {
+    private void releaseReservations(String streamId, List<TileId> tiles, int fromIndex) {
+        boolean released = false;
         synchronized (stateLock) {
             for (int i = fromIndex; i < tiles.size(); i++) {
-                inFlight.remove(tiles.get(i));
+                released |= inFlight.remove(tiles.get(i), streamId);
             }
         }
+        if (released) rescheduleMissingTiles();
+    }
+
+    /** Revisión por eventos, sin temporizador ni espera de ACK para transmitir. */
+    private void rescheduleMissingTiles() {
+        var pending = new EnumMap<DataChannel, StreamPlan>(DataChannel.class);
+        synchronized (stateLock) {
+            if (!running) return;
+            for (var entry : activePlans.entrySet()) {
+                boolean missing = entry.getValue().tiles().stream()
+                        .anyMatch(tile -> !clientHas.contains(tile) && !inFlight.containsKey(tile));
+                if (missing) pending.put(entry.getKey(), entry.getValue());
+            }
+        }
+        // No anidar stateLock con el lock de un worker.
+        pending.forEach((channel, plan) -> workers.get(channel).requestRecheck(plan));
+    }
+
+    /** Debe invocarse bajo stateLock. El fin de un stream no implica vista completa. */
+    private void logViewCompleteIfReady() {
+        if (viewCompleteLogged || currentViewId == null || activePlans.isEmpty()) return;
+        int total = 0;
+        for (StreamPlan plan : activePlans.values()) {
+            for (TileId tile : plan.tiles()) {
+                if (!clientHas.contains(tile)) return;
+                total++;
+            }
+        }
+        viewCompleteLogged = true;
+        System.out.println("[VIEW_COMPLETE] session=" + sessionId + " view=" + currentViewId
+                + " confirmed=" + total + "/" + total);
     }
 
     private static String sanitize(String text) {
@@ -311,6 +365,8 @@ public class ClientSession implements AutoCloseable {
         synchronized (stateLock) {
             clientHas.clear();
             inFlight.clear();
+            activePlans.clear();
+            currentViewId = null;
         }
     }
 
@@ -326,9 +382,10 @@ public class ClientSession implements AutoCloseable {
         private final Object lock = new Object();
 
         private WebSocketConnection connection;
+        private StreamPlan latestPlan;
         private StreamPlan pendingPlan;
         private long generation;
-        private boolean workerRunning = true;
+        private volatile boolean workerRunning = true;
         private Thread thread;
 
         private DataWorker(DataChannel channel) {
@@ -364,8 +421,18 @@ public class ClientSession implements AutoCloseable {
 
         void replacePlan(StreamPlan plan) {
             synchronized (lock) {
+                latestPlan = plan;
                 pendingPlan = plan;
                 generation++;
+                lock.notifyAll();
+            }
+        }
+
+        void requestRecheck(StreamPlan plan) {
+            synchronized (lock) {
+                if (!workerRunning || latestPlan != plan || pendingPlan != null) return;
+                pendingPlan = plan;
+                // Revisar faltantes no invalida el stream que sigue enviándose.
                 lock.notifyAll();
             }
         }
@@ -397,12 +464,12 @@ public class ClientSession implements AutoCloseable {
                     myGeneration = generation;
                 }
 
-                List<TileId> reserved = reserveTiles(plan.tiles());
+                String streamId = Long.toString(nextStreamId.getAndIncrement());
+                List<TileId> reserved = reserveTiles(channel, plan, streamId);
                 if (reserved.isEmpty()) {
                     continue;
                 }
 
-                String streamId = Long.toString(nextStreamId.getAndIncrement());
                 int sentCount = 0;
 
                 try {
@@ -421,7 +488,7 @@ public class ClientSession implements AutoCloseable {
                             () -> isGenerationCurrent(myGeneration, target)
                     );
 
-                    releaseReservations(reserved, sentCount);
+                    releaseReservations(streamId, reserved, sentCount);
 
                     System.out.println("[STREAM " + channel + "] fin stream=" + streamId
                             + " enviados=" + sentCount + "/" + reserved.size());
@@ -429,7 +496,7 @@ public class ClientSession implements AutoCloseable {
                     // Ante un fallo no sabemos con certeza qué llegó; los ACK ya
                     // recibidos permanecen en clientHas y el resto queda libre
                     // para una futura retransmisión.
-                    releaseReservations(reserved, 0);
+                    releaseReservations(streamId, reserved, 0);
                     synchronized (lock) {
                         if (connection == target) {
                             connection = null;
@@ -456,6 +523,7 @@ public class ClientSession implements AutoCloseable {
         public void close() {
             workerRunning = false;
             synchronized (lock) {
+                latestPlan = null;
                 pendingPlan = null;
                 if (connection != null) {
                     try {

@@ -1,8 +1,6 @@
 import { NthChanceClock } from './NthChanceClock.js';
-import { tileKey, visibleTileKeys, zoomTarget } from './geometry.js';
+import { MAX_CACHED_TILES, tileKey, visibleTileKeys } from './geometry.js';
 
-// Un reloj por NIVEL, no por WebSocket: un stream antiguo de NEXT puede
-// contener tiles que ahora pertenecen a CURRENT. Nunca duplicamos sus bytes.
 export class TileClockCache {
   constructor(onEvict = () => {}) {
     this.onEvict = onEvict;
@@ -29,15 +27,9 @@ export class TileClockCache {
     this.desired = new Set(desiredKeys);
     this.central = new Set(visibleTileKeys(image, view));
     const roles = new Map();
-    if (view.zoom > 0) roles.set(view.zoom, { role: 'CURRENT', capacity: 32 });
+    if (view.zoom > 0) roles.set(view.zoom, { role: 'CURRENT', capacity: 36 });
     if (view.zoom > 1) roles.set(view.zoom - 1, { role: 'PREVIOUS', capacity: 16 });
     if (view.zoom < image.maxZoom) roles.set(view.zoom + 1, { role: 'NEXT', capacity: 16 });
-    // En ROOT se conservan hasta 16 tiles ya recibidos de z=1. No se pide un
-    // stream nuevo; se favorece la región que usará el próximo zoom central.
-    if (view.zoom === 0 && image.maxZoom > 0) {
-      const next = zoomTarget(image, view, 1);
-      if (next) this.desired = new Set(visibleTileKeys(image, next));
-    }
     for (const [zoom, level] of this.levels) {
       if (!roles.has(zoom)) { level.clock.clear(); this.levels.delete(zoom); }
     }
@@ -55,7 +47,6 @@ export class TileClockCache {
         this.levels.set(zoom, level);
       }
       level.role = role;
-      // La nueva región se referencia antes de recorrer la lista al reducir.
       for (const key of this.desired) if (level.clock.has(key)) level.clock.touch(key, this.chances(key));
       level.clock.resize(capacity, this.desired);
     }
@@ -64,9 +55,6 @@ export class TileClockCache {
   chances(key) { return this.central.has(key) ? 2 : 1; }
   touch(key) { return this.owners.get(key)?.touch(key, this.chances(key)) || false; }
 
-  // Las entradas fuera de la vista permanecen hasta que haya presión, pero
-  // no se admiten datos nuevos obsoletos salvo un tile de continuidad visual.
-  // Ese extra usa sólo un hueco libre y no puede desalojar el plan A+B+C+D.
   set(key, tile, { allowExtra = false } = {}) {
     const level = this.levels.get(tile.zoom);
     if (tile.imageId !== this.imageId || !level
@@ -91,7 +79,7 @@ export class TileClockCache {
 
   inspect() {
     return {
-      algorithm: 'Nth-chance Clock', size: this.size, limit: 64, evictions: this.evictions,
+      algorithm: 'Nth-chance Clock', size: this.size, limit: MAX_CACHED_TILES, evictions: this.evictions,
       levels: [...this.levels.values()].sort((a, b) => a.zoom - b.zoom).map(({ zoom, role, clock }) => ({
         zoom, role, ...clock.inspect(this.desired),
       })),

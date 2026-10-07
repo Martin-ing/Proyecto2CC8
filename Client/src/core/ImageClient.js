@@ -1,13 +1,13 @@
 import {
-  DATA_CHANNELS, TILE_SIZE, VIEWPORT_TILES, TILE_FADE_MS, clamp, levelVirtualSize,
-  tilesPerAxis, tileKey, zoomTarget, planDesiredTileKeys, visibleTileKeys,
-  cameraForView, cameraTileKeys, viewForCamera, clampCamera,
+  DATA_CHANNELS, TILE_SIZE, TILE_FADE_MS, levelVirtualSize,
+  tilesPerAxis, tileKey, zoomTarget, planDesiredTileKeys,
+  cameraForView, cameraTileKeys, viewForCamera, clampCamera, MAX_VISUAL_ZOOM, VIEWPORT_PIXELS,
 } from './geometry.js';
 import { bytesPerPixel } from './pixels.js';
 import { LayerRenderer } from './LayerRenderer.js';
 import { TileClockCache } from './TileClockCache.js';
 
-const initialView = () => ({ zoom: 0, currentX: 0, currentY: 0, viewId: null });
+const initialView = () => ({ zoom: 0, currentX: 0, currentY: 0, visualZoom: 1, viewId: null });
 const DEFAULT_URL = 'ws://localhost:8080/ws';
 
 export class ImageClient {
@@ -25,7 +25,7 @@ export class ImageClient {
     this.rootRequest = null;
     this.rootInfo = null;
     this.rootProgress = { received: 0, total: 0 };
-    this.format = 'RGBA8888';
+    this.format = 'RGBA4444';
     this.url = DEFAULT_URL;
     this.connection = 'disconnected';
     this.status = 'Conecta con tu servidor para comenzar.';
@@ -52,18 +52,19 @@ export class ImageClient {
 
   publish() {
     const ready = this.allReady();
-    const visible = this.transitioning ? visibleTileKeys(this.selectedImage, this.view) : this.actualVisibleKeys();
+    const visible = this.transitioning && this.selectedImage
+      ? this.actualVisibleKeys(this.renderer.animation?.to || cameraForView(this.selectedImage, this.view))
+      : this.actualVisibleKeys();
     const visibleReady = visible.filter(key => this.tileCache.has(key)).length;
+    const renderedReady = visible.filter(key => this.tileCache.has(key)
+      && this.renderer.drawnTiles?.get(key) === this.tileCache.get(key)).length;
     let desiredReady = 0, cacheBytes = 0;
     for (const key of this.desiredTileKeys) if (this.tileCache.has(key)) desiredReady++;
     for (const tile of this.tileCache.values()) cacheBytes += tile.buffer.byteLength;
     const canNavigate = ready && !!this.rootInfo && !this.rootRequest && !this.transitioning && !this.dragging && !this.panning;
-    const maxStart = this.selectedImage && this.view.zoom > 0
-      ? tilesPerAxis(this.selectedImage, this.view.zoom) - VIEWPORT_TILES : 0;
     const camera = this.renderer.camera;
-    const step = TILE_SIZE / 2 ** this.view.zoom;
-    const visualX = camera ? camera.x / step : this.view.currentX;
-    const visualY = camera ? camera.y / step : this.view.currentY;
+    const cameraLimit = this.selectedImage && camera ? levelVirtualSize(this.selectedImage, 0) - camera.size : 0;
+    const visualZoom = this.view.visualZoom || 1;
     this.snapshot = {
       url: this.url, connection: this.connection, status: this.status, error: this.error,
       ready, sessionId: this.sessionId, images: this.images, catalogLoaded: this.catalogLoaded,
@@ -72,20 +73,21 @@ export class ImageClient {
       rootLoading: this.rootRequest !== null, rootProgress: { ...this.rootProgress },
       view: { ...this.view }, transitioning: this.transitioning, transitionFrom: this.transitionFrom,
       dragging: this.dragging, panning: this.panning,
-      canDrag: canNavigate && this.view.zoom > 0 && maxStart > 0,
+      canDrag: canNavigate && cameraLimit > 1e-8,
       cacheSize: this.tileCache.size, cacheBytes, desiredReady, desiredCount: this.desiredTileKeys.size,
       clockCache: this.tileCache.inspect(),
-      visibleReady, visibleTotal: visible.length,
+      visibleReady, renderedReady, visibleTotal: visible.length,
       retainedCount: [...this.pinnedTileKeys].filter(key => this.tileCache.has(key)).length,
       fallbackActive: !!this.renderer.fallback,
       axisTiles: this.selectedImage && this.view.zoom > 0 ? tilesPerAxis(this.selectedImage, this.view.zoom) : 0,
-      canZoomIn: canNavigate && !!zoomTarget(this.selectedImage, this.view, 1),
-      canZoomOut: canNavigate && this.view.zoom > 0,
+      canZoomIn: canNavigate && (!!zoomTarget(this.selectedImage, this.view, 1)
+        || (this.view.zoom === this.selectedImage.maxZoom && visualZoom < MAX_VISUAL_ZOOM)),
+      canZoomOut: canNavigate && (this.view.zoom > 0 || visualZoom > 1),
       pan: {
-        up: canNavigate && this.view.zoom > 0 && visualY > 1e-8,
-        down: canNavigate && this.view.zoom > 0 && visualY < maxStart - 1e-8,
-        left: canNavigate && this.view.zoom > 0 && visualX > 1e-8,
-        right: canNavigate && this.view.zoom > 0 && visualX < maxStart - 1e-8,
+        up: canNavigate && camera?.y > 1e-8,
+        down: canNavigate && camera?.y < cameraLimit - 1e-8,
+        left: canNavigate && camera?.x > 1e-8,
+        right: canNavigate && camera?.x < cameraLimit - 1e-8,
       },
       channels: [
         { name: 'CONTROL', joined: this.control?.readyState === 1 && !!this.sessionId, progress: null },
@@ -304,6 +306,9 @@ export class ImageClient {
     this.visualSignature = '';
     this.rootRequest = { requestId: String(this.nextRequestId++), imageId: image.id, format: this.format };
     this.send(`ROOT ${this.rootRequest.requestId} ${image.id} ${this.format}`);
+    // El mismo CONTROL procesa ROOT y después prepara NEXT. La caché queda
+    // configurada antes de que puedan llegar tiles desde el otro socket.
+    this.changeView(this.view, false, { keepCamera: true });
     this.setStatus(`Cargando la vista general de ${image.name}…`);
   }
 
@@ -440,6 +445,11 @@ export class ImageClient {
 
   zoom(direction) {
     if (!this.allReady() || !this.rootInfo || this.rootRequest || this.transitioning || this.dragging || this.panning) return false;
+    if (direction !== 1 && direction !== -1) return false;
+    const factor = this.view.visualZoom || 1;
+    if ((direction > 0 && this.view.zoom === this.selectedImage.maxZoom) || (direction < 0 && factor > 1)) {
+      return this.zoomPixels(factor * (direction > 0 ? 2 : 0.5));
+    }
     const target = zoomTarget(this.selectedImage, this.view, direction);
     if (!target) return false;
     // Se usa la celda del centro ya renderizado, nunca el objetivo pendiente
@@ -452,32 +462,60 @@ export class ImageClient {
       .map(([key]) => key));
     this.transitionFrom = this.view.zoom;
     this.transitioning = true;
-    this.changeView(target, true);
+    this.changeView({ ...target, visualZoom: 1 }, true);
+    return true;
+  }
+
+  zoomPixels(visualZoom) {
+    if (visualZoom < 1 || visualZoom > MAX_VISUAL_ZOOM) return false;
+    const camera = this.renderer.camera;
+    if (!camera) return false;
+    const base = this.view.zoom === 0 ? levelVirtualSize(this.selectedImage, 0) : VIEWPORT_PIXELS / 2 ** this.view.zoom;
+    const size = base / visualZoom;
+    const destination = clampCamera(this.selectedImage, this.view.zoom, {
+      x: camera.x + (camera.size - size) / 2,
+      y: camera.y + (camera.size - size) / 2, size,
+    });
+    const target = { ...viewForCamera(this.selectedImage, this.view.zoom, destination), visualZoom };
+    this.renderer.panMotion.stop();
+    this.renderer.captureFallback();
+    this.transitionFrom = this.view.zoom;
+    this.transitioning = true;
+    // El aumento por sí solo no crea un VIEWPORT. Al reducir cerca del borde,
+    // el límite de la imagen puede desplazar el centro a otra celda.
+    if (target.currentX !== this.view.currentX || target.currentY !== this.view.currentY) {
+      this.changeView(target, false, { keepCamera: true });
+    } else this.view = { ...this.view, visualZoom };
+    this.renderer.moveTo(this.view, true, destination);
+    this.setStatus(`Ampliación visual ${visualZoom}× del nivel ${this.view.zoom}.`);
     return true;
   }
 
   changeView(target, animate = false, { keepCamera = false } = {}) {
     const previousId = this.view.viewId;
-    const viewId = target.zoom === 0 ? null : String(this.nextViewId++);
-    this.view = { ...target, viewId };
     this.desiredTileKeys = planDesiredTileKeys(this.selectedImage, target.zoom, target.currentX, target.currentY);
+    const viewId = this.desiredTileKeys.size ? String(this.nextViewId++) : null;
+    this.view = { visualZoom: 1, ...target, viewId };
     // Los desalojos por rotación de niveles se notifican ANTES de VIEWPORT.
     // Salir de la región deseada ya no elimina de inmediato un tile.
     this.tileCache.configure(this.selectedImage, this.view, this.desiredTileKeys);
     if (!keepCamera) this.renderer.moveTo(this.view, animate);
-    if (target.zoom === 0) {
+    if (!viewId) {
       if (previousId) this.send(`CANCEL ${previousId}`);
       this.setStatus('Volviendo a la ROOT local…');
     } else {
       this.send(`VIEWPORT ${viewId} ${this.selectedImage.id} ${target.zoom} ${target.currentX} ${target.currentY}`);
-      this.setStatus(`Vista ${viewId}: nivel ${target.zoom}, ventana 4 × 4 desde (${target.currentX}, ${target.currentY}).`);
+      this.setStatus(target.zoom === 0 ? 'ROOT local y precarga del primer nivel…'
+        : `Vista ${viewId}: nivel ${target.zoom}, ventana 4 × 4 desde (${target.currentX}, ${target.currentY}).`);
     }
   }
 
   finishTransition() {
     this.transitioning = false;
-    if (!this.error) this.status = this.view.zoom === 0
-      ? 'ROOT restaurada desde la copia local.' : `Nivel ${this.view.zoom} activo. Los tiles se completan conforme llegan.`;
+    if (!this.error) this.status = (this.view.visualZoom || 1) > 1
+      ? `Nivel ${this.view.zoom} · ampliación visual ${this.view.visualZoom}×.`
+      : this.view.zoom === 0 ? 'ROOT restaurada desde la copia local.'
+        : `Nivel ${this.view.zoom} activo. Los tiles se completan conforme llegan.`;
     this.publish();
   }
 
@@ -492,23 +530,27 @@ export class ImageClient {
     if (!this.renderer.fallback && extras.size === this.pinnedTileKeys.size
       && [...extras].every(key => this.pinnedTileKeys.has(key))) return;
     this.renderer.clearFallback();
-    // Una esquina visible puede estar fuera de A+B. Puede aprovechar espacio
-    // libre, pero no ampliar la caché ni desalojar tiles del plan vigente.
+    // Sólo se retienen extras útiles de una transición, sin ampliar el cupo.
     this.pinnedTileKeys = extras;
     this.publish();
   }
 
   pan(dx, dy) {
-    if (!this.allReady() || !this.rootInfo || this.transitioning || this.panning || this.dragging || this.view.zoom < 1) return false;
-    const max = tilesPerAxis(this.selectedImage, this.view.zoom) - VIEWPORT_TILES;
-    const currentX = clamp(this.view.currentX + dx, 0, max), currentY = clamp(this.view.currentY + dy, 0, max);
-    const target = { zoom: this.view.zoom, currentX, currentY };
-    const destination = cameraForView(this.selectedImage, target);
+    if (!this.allReady() || !this.rootInfo || this.rootRequest || this.transitioning || this.panning || this.dragging) return false;
     const camera = this.renderer.camera;
+    if (!camera) return false;
+    const step = TILE_SIZE / 2 ** this.view.zoom;
+    const base = this.view.zoom === 0 ? levelVirtualSize(this.selectedImage, 0) : VIEWPORT_PIXELS / 2 ** this.view.zoom;
+    const inset = (base - camera.size) / 2;
+    const destination = clampCamera(this.selectedImage, this.view.zoom, {
+      x: (Math.round((camera.x - inset) / step) + dx) * step + inset,
+      y: (Math.round((camera.y - inset) / step) + dy) * step + inset, size: camera.size,
+    });
+    const target = { ...viewForCamera(this.selectedImage, this.view.zoom, destination), visualZoom: this.view.visualZoom || 1 };
     if (!camera || (Math.abs(destination.x - camera.x) < 1e-8 && Math.abs(destination.y - camera.y) < 1e-8)) return false;
     this.preparePan();
     this.panning = true;
-    this.renderer.startPan(target);
+    this.renderer.startPan(target, destination);
     this.publish();
     return true;
   }
@@ -522,7 +564,7 @@ export class ImageClient {
 
   beginDrag() {
     if (!this.allReady() || !this.rootInfo || this.rootRequest || this.transitioning || this.panning || this.dragging
-      || this.view.zoom < 1 || tilesPerAxis(this.selectedImage, this.view.zoom) <= VIEWPORT_TILES) return false;
+      || !this.renderer.camera || this.renderer.camera.size >= levelVirtualSize(this.selectedImage, 0)) return false;
     this.preparePan();
     this.dragging = true;
     this.renderer.panMotion.startDrag(this.renderer.camera, this.view.zoom, performance.now());
@@ -559,7 +601,7 @@ export class ImageClient {
   commitPanCamera(nextCamera) {
     if (!this.allReady()) { this.stopFreePan(); return; }
     const camera = clampCamera(this.selectedImage, this.view.zoom, nextCamera);
-    const target = viewForCamera(this.selectedImage, this.view.zoom, camera);
+    const target = { ...viewForCamera(this.selectedImage, this.view.zoom, camera), visualZoom: this.view.visualZoom || 1 };
     const changed = target.currentX !== this.view.currentX || target.currentY !== this.view.currentY;
     // La captura conserva sus coordenadas originales durante todo el gesto.
     // Los tiles todavía visibles se retienen abajo; no se vuelve a muestrear

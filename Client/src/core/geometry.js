@@ -3,6 +3,8 @@ export const VIEWPORT_TILES = 4;
 export const VIEWPORT_PIXELS = TILE_SIZE * VIEWPORT_TILES;
 export const ZOOM_DURATION_MS = 1000;
 export const TILE_FADE_MS = 180;
+export const MAX_VISUAL_ZOOM = 8;
+export const MAX_CACHED_TILES = 68;
 export const DATA_CHANNELS = ['CURRENT', 'PREVIOUS', 'NEXT'];
 export const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 export const tileKey = (id, z, x, y) => `${id}:${z}:${x}:${y}`;
@@ -18,17 +20,24 @@ export function tilesPerAxis(image, zoom) {
 // Un único espacio de coordenadas: píxeles virtuales de nivel 0.
 // El padding ya viene en ROOT y en los tiles. No se vuelve a sumar offsetX/Y.
 export function cameraForView(image, view) {
-  if (view.zoom === 0) return { x: 0, y: 0, size: levelVirtualSize(image, 0) };
+  const visualZoom = view.visualZoom || 1;
+  if (view.zoom === 0) {
+    const rootSize = levelVirtualSize(image, 0), size = rootSize / visualZoom;
+    return { x: (rootSize - size) / 2, y: (rootSize - size) / 2, size };
+  }
   const scale = 2 ** view.zoom;
+  const size = VIEWPORT_PIXELS / scale / visualZoom;
+  const inset = (VIEWPORT_PIXELS / scale - size) / 2;
   return {
-    x: view.currentX * TILE_SIZE / scale,
-    y: view.currentY * TILE_SIZE / scale,
-    size: VIEWPORT_PIXELS / scale,
+    x: view.currentX * TILE_SIZE / scale + inset,
+    y: view.currentY * TILE_SIZE / scale + inset,
+    size,
   };
 }
 
 export function clampCamera(image, zoom, camera) {
-  const size = zoom === 0 ? levelVirtualSize(image, 0) : VIEWPORT_PIXELS / 2 ** zoom;
+  const base = zoom === 0 ? levelVirtualSize(image, 0) : VIEWPORT_PIXELS / 2 ** zoom;
+  const size = clamp(camera.size ?? base, base / MAX_VISUAL_ZOOM, base);
   const max = Math.max(0, levelVirtualSize(image, 0) - size);
   return { x: clamp(camera.x, 0, max), y: clamp(camera.y, 0, max), size };
 }
@@ -39,16 +48,17 @@ export function clampCamera(image, zoom, camera) {
 export function viewForCamera(image, zoom, camera) {
   if (zoom === 0) return { zoom: 0, currentX: 0, currentY: 0 };
   const step = TILE_SIZE / 2 ** zoom;
+  const inset = (VIEWPORT_PIXELS / 2 ** zoom - camera.size) / 2;
   const maxStart = Math.max(0, tilesPerAxis(image, zoom) - VIEWPORT_TILES);
   return {
     zoom,
-    currentX: clamp(Math.floor(camera.x / step + 0.5), 0, maxStart),
-    currentY: clamp(Math.floor(camera.y / step + 0.5), 0, maxStart),
+    currentX: clamp(Math.floor((camera.x - inset) / step + 0.5), 0, maxStart),
+    currentY: clamp(Math.floor((camera.y - inset) / step + 0.5), 0, maxStart),
   };
 }
 
 // Una ventana 4x4 fraccional puede intersectar 5x5 tiles. Se cuenta la
-// cobertura real sin ampliar el plan de solicitudes del servidor.
+// cobertura real, incluyendo las esquinas del anillo de vecinos.
 export function cameraTileKeys(image, zoom, camera) {
   if (!image || !camera || zoom === 0) return [];
   const step = TILE_SIZE / 2 ** zoom;
@@ -114,10 +124,9 @@ export function zoomTarget(image, view, direction) {
   };
 }
 
-// Conserva exactamente el plan A+B+C+D del servidor actual.
+// Debe coincidir con TilePlanner: centro 4x4, anillo 6x6 y niveles adyacentes.
 export function planDesiredTileKeys(image, zoom, currentX, currentY) {
   const keys = new Set();
-  if (zoom === 0) return keys;
   const add = (z, x, y) => {
     const count = tilesPerAxis(image, z);
     if (x >= 0 && y >= 0 && x < count && y < count) keys.add(tileKey(image.id, z, x, y));
@@ -127,12 +136,20 @@ export function planDesiredTileKeys(image, zoom, currentX, currentY) {
       for (let column = x; column < x + VIEWPORT_TILES; column++) add(z, column, row);
     }
   };
+  if (zoom === 0) {
+    const next = zoomTarget(image, { zoom: 0 }, 1);
+    if (next) square(next.zoom, next.currentX, next.currentY);
+    return keys;
+  }
   square(zoom, currentX, currentY);
   for (let i = 0; i < VIEWPORT_TILES; i++) {
     add(zoom, currentX + i, currentY - 1);
     add(zoom, currentX + i, currentY + VIEWPORT_TILES);
     add(zoom, currentX - 1, currentY + i);
     add(zoom, currentX + VIEWPORT_TILES, currentY + i);
+  }
+  for (const x of [currentX - 1, currentX + VIEWPORT_TILES]) {
+    for (const y of [currentY - 1, currentY + VIEWPORT_TILES]) add(zoom, x, y);
   }
   const view = { zoom, currentX, currentY };
   if (zoom < image.maxZoom) {

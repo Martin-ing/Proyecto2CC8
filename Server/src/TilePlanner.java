@@ -18,9 +18,29 @@ public class TilePlanner {
                     + image.tileSize());
         }
 
-        if (zoom < 1 || zoom > image.maxZoom()) {
+        if (zoom < 0 || zoom > image.maxZoom()) {
             throw new IOException("Zoom inválido: " + zoom
-                    + ". Para tiles se permite 1.." + image.maxZoom());
+                    + ". Se permite 0.." + image.maxZoom());
+        }
+
+        // ROOT viaja por CONTROL. Su vista sólo prepara los 16 tiles del
+        // primer zoom central en NEXT, sin duplicar ROOT en CURRENT.
+        if (zoom == 0) {
+            if (currentX != 0 || currentY != 0) {
+                throw new IOException("La vista ROOT requiere currentX=0 y currentY=0");
+            }
+            Map<TileId, TilePlanEntry> rootPlan = new LinkedHashMap<>();
+            if (image.maxZoom() > 0) {
+                ImageLevel root = requireLevel(image, 0);
+                ImageLevel next = requireLevel(image, 1);
+                validateAdjacentLevels(root, next, 0, 1);
+                int count = tilesPerAxis(image, next);
+                if (count < VIEWPORT_TILES) throw new IOException("El nivel 1 no alcanza para una ventana 4x4");
+                int start = (count - VIEWPORT_TILES) / 2;
+                addGrid(rootPlan, image.id(), 1, start, start,
+                        VIEWPORT_TILES, VIEWPORT_TILES, count, 3, "D_NEXT");
+            }
+            return new ArrayList<>(rootPlan.values());
         }
 
         ImageLevel current = requireLevel(image, zoom);
@@ -55,6 +75,13 @@ public class TilePlanner {
                     currentTiles, 2, "B_NEIGHBOR");
             addIfValid(ordered, image.id(), zoom, currentX + VIEWPORT_TILES, y,
                     currentTiles, 2, "B_NEIGHBOR");
+        }
+
+        for (int x : new int[]{currentX - 1, currentX + VIEWPORT_TILES}) {
+            for (int y : new int[]{currentY - 1, currentY + VIEWPORT_TILES}) {
+                addIfValid(ordered, image.id(), zoom, x, y,
+                        currentTiles, 2, "B_NEIGHBOR");
+            }
         }
 
         if (zoom < image.maxZoom()) {

@@ -1,11 +1,9 @@
 import {
   VIEWPORT_PIXELS, ZOOM_DURATION_MS, TILE_FADE_MS, cameraForView,
-  tileWorldRect, projectRect, interpolateCamera, clamp, levelVirtualSize,
+  tileWorldRect, projectRect, interpolateCamera, clamp, levelVirtualSize, MAX_CACHED_TILES, cameraTileKeys,
 } from './geometry.js';
 import { pixelSurface, releaseSurface } from './pixels.js';
 import { PanMotion } from './PanMotion.js';
-
-const MAX_DECODED_TILES = 64;
 
 export class LayerRenderer {
   constructor(client) {
@@ -19,6 +17,7 @@ export class LayerRenderer {
     this.frame = null;
     this.targetSince = 0;
     this.decoded = new Map();
+    this.drawnTiles = new Map();
     this.panMotion = new PanMotion();
   }
 
@@ -54,9 +53,8 @@ export class LayerRenderer {
     this.fallback = null;
   }
 
-  moveTo(view, animate) {
+  moveTo(view, animate, destination = cameraForView(this.client.selectedImage, view)) {
     this.panMotion.stop();
-    const destination = cameraForView(this.client.selectedImage, view);
     if (animate && this.camera) {
       this.targetSince = performance.now();
       this.animation = {
@@ -69,8 +67,8 @@ export class LayerRenderer {
     this.requestDraw();
   }
 
-  startPan(view) {
-    this.panMotion.startStep(this.camera, cameraForView(this.client.selectedImage, view), view.zoom, performance.now());
+  startPan(view, destination = cameraForView(this.client.selectedImage, view)) {
+    this.panMotion.startStep(this.camera, destination, view.zoom, performance.now());
     this.requestDraw();
   }
 
@@ -98,6 +96,7 @@ export class LayerRenderer {
   forget(key) {
     releaseSurface(this.decoded.get(key)?.surface);
     this.decoded.delete(key);
+    if (this.drawnTiles.delete(key)) this.client.schedulePublish();
   }
 
   texture(key, tile) {
@@ -111,21 +110,30 @@ export class LayerRenderer {
     return entry.surface;
   }
 
-  // Fundido sobre el fondo mientras llega el detalle. Al completar el fade,
-  // se reemplaza también el alfa: no quedan imágenes fantasma en el padding.
+  // Fundido sobre el fondo mientras llega el detalle. Al terminar, limpiar
+  // sólo el rectángulo y dibujar con source-over también reemplaza el alfa,
+  // sin la composición copy + clip por tile (costosa en Canvas 2D).
   paint(surface, worldRect, opacity = 1) {
     if (opacity <= 0) return;
-    const r = projectRect(worldRect, this.camera);
+    // Recortar antes de escalar: en z=8 la ROOT completa se proyectaría a
+    // 262144×262144 aunque el canvas sólo muestre 1024×1024 píxeles.
+    const c = this.camera;
+    const x = Math.max(worldRect.x, c.x), y = Math.max(worldRect.y, c.y);
+    const right = Math.min(worldRect.x + worldRect.width, c.x + c.size);
+    const bottom = Math.min(worldRect.y + worldRect.height, c.y + c.size);
+    if (right <= x || bottom <= y) return;
+    const r = projectRect({ x, y, width: right - x, height: bottom - y }, c);
+    const sx = (x - worldRect.x) * surface.width / worldRect.width;
+    const sy = (y - worldRect.y) * surface.height / worldRect.height;
+    const sw = (right - x) * surface.width / worldRect.width;
+    const sh = (bottom - y) * surface.height / worldRect.height;
     const ctx = this.context;
     ctx.save();
     if (opacity >= 1) {
-      ctx.beginPath();
-      ctx.rect(r.x, r.y, r.width, r.height);
-      ctx.clip();
-      ctx.globalCompositeOperation = 'copy';
+      ctx.clearRect(r.x, r.y, r.width, r.height);
     }
     ctx.globalAlpha = opacity;
-    ctx.drawImage(surface, r.x, r.y, r.width, r.height);
+    ctx.drawImage(surface, sx, sy, sw, sh, r.x, r.y, r.width, r.height);
     ctx.restore();
   }
 
@@ -145,32 +153,43 @@ export class LayerRenderer {
     }
     const ctx = this.context;
     ctx.clearRect(0, 0, VIEWPORT_PIXELS, VIEWPORT_PIXELS);
-    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingEnabled = (view.visualZoom || 1) === 1;
     ctx.imageSmoothingQuality = 'high';
     const rootSize = levelVirtualSize(image, 0);
     const rootRect = { x: 0, y: 0, width: rootSize, height: rootSize };
 
-    // 1. ROOT siempre está cargada y siempre se dibuja como base.
-    this.paint(this.root, rootRect);
     const entries = [...tileCache.entries()].filter(([, tile]) => tile.imageId === image.id);
+    const drawnTiles = new Map();
+    // Los tiles precargados se muestran de inmediato. Sólo se funden los que
+    // acaban de llegar; un cambio de cámara no reinicia su fundido.
+    const tileAlpha = tile => clamp((now - tile.receivedAt) / TILE_FADE_MS, 0, 1);
+    const visible = cameraTileKeys(image, view.zoom, this.camera);
+    const detailCoversView = visible.length > 0 && visible.every(key => {
+      const tile = tileCache.get(key);
+      return tile && tileAlpha(tile) >= 1;
+    });
     const drawTile = (key, tile, alpha = 1) => {
       const rect = tileWorldRect(tile);
       if (!this.isVisible(rect) || alpha <= 0) return;
       this.client.tileCache.touch(key);
       this.paint(this.texture(key, tile), rect, alpha);
+      if (tile.zoom === view.zoom) drawnTiles.set(key, tile);
     };
-    // 2. Prefetch del nivel inferior, en su escala real.
-    entries.filter(([key, tile]) => tile.zoom < view.zoom && !pinnedTileKeys.has(key))
-      .sort((a, b) => a[1].zoom - b[1].zoom)
-      .forEach(([key, tile]) => drawTile(key, tile));
-    // 3. Composición que el usuario estaba viendo antes del cambio.
-    if (this.fallback) {
-      const { surface, camera } = this.fallback;
-      this.paint(surface, { x: camera.x, y: camera.y, width: camera.size, height: camera.size });
+    // ROOT permanece en memoria. Dibujar las capas inferiores sólo ayuda
+    // cuando falta detalle o continúa su fundido; si ya está completo, esas
+    // capas se borrarían inmediatamente, incluso en el padding transparente.
+    if (!detailCoversView) {
+      this.paint(this.root, rootRect);
+      entries.filter(([key, tile]) => tile.zoom < view.zoom && !pinnedTileKeys.has(key))
+        .sort((a, b) => a[1].zoom - b[1].zoom)
+        .forEach(([key, tile]) => drawTile(key, tile));
+      if (this.fallback) {
+        const { surface, camera } = this.fallback;
+        this.paint(surface, { x: camera.x, y: camera.y, width: camera.size, height: camera.size });
+      }
+      entries.filter(([key, tile]) => pinnedTileKeys.has(key) && tile.zoom !== view.zoom)
+        .forEach(([key, tile]) => drawTile(key, tile));
     }
-    // 4. Tiles del nivel que acabamos de abandonar, incluidos sus vecinos.
-    entries.filter(([key, tile]) => pinnedTileKeys.has(key) && tile.zoom !== view.zoom)
-      .forEach(([key, tile]) => drawTile(key, tile));
     // 5. El nivel solicitado siempre termina encima, incluso al hacer zoom out.
     let fading = false;
     if (view.zoom === 0) {
@@ -179,12 +198,16 @@ export class LayerRenderer {
     } else {
       for (const [key, tile] of entries) {
         if (tile.zoom !== view.zoom || !this.isVisible(tileWorldRect(tile))) continue;
-        const alpha = clamp((now - Math.max(tile.receivedAt, this.targetSince)) / TILE_FADE_MS, 0, 1);
+        const alpha = tileAlpha(tile);
         if (alpha < 1) fading = true;
         drawTile(key, tile, alpha);
       }
     }
-    while (this.decoded.size > MAX_DECODED_TILES) this.forget(this.decoded.keys().next().value);
+    while (this.decoded.size > MAX_CACHED_TILES) this.forget(this.decoded.keys().next().value);
+    const changed = drawnTiles.size !== this.drawnTiles.size
+      || [...drawnTiles].some(([key, tile]) => this.drawnTiles.get(key) !== tile);
+    this.drawnTiles = drawnTiles;
+    if (changed) this.client.schedulePublish();
     if (this.animation && animationProgress >= 1) {
       this.camera = this.animation.to;
       this.animation = null;
@@ -204,6 +227,7 @@ export class LayerRenderer {
     this.root = null;
     this.clearFallback();
     for (const key of this.decoded.keys()) this.forget(key);
+    this.drawnTiles.clear();
     this.context?.clearRect(0, 0, VIEWPORT_PIXELS, VIEWPORT_PIXELS);
   }
 }

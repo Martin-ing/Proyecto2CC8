@@ -1,6 +1,6 @@
-import { clamp, clampCamera, interpolateCamera } from './geometry.js';
+import { VIEWPORT_PIXELS, clamp, clampCamera, interpolateCamera } from './geometry.js';
 
-// Píxeles del nivel actual por segundo: 512 = dos tiles por segundo.
+// Píxeles del canvas por segundo: con aumento visual se recorre menos imagen.
 // El límite es vectorial, por lo que una diagonal no avanza más rápido.
 export const PAN_SPEED_PX_PER_SECOND = 512;
 export const PAN_FOLLOW_MS = 100;
@@ -27,7 +27,7 @@ export class PanMotion {
     this.kind = 'drag';
     this.dragging = true;
     this.target = { ...camera };
-    this.scale = 2 ** zoom;
+    this.scale = VIEWPORT_PIXELS / camera.size;
     this.lastTime = now;
   }
 
@@ -54,7 +54,7 @@ export class PanMotion {
     this.kind = 'step';
     this.from = { ...camera };
     this.target = { ...destination };
-    this.scale = 2 ** zoom;
+    this.scale = VIEWPORT_PIXELS / camera.size;
     this.lastTime = now;
     const distance = Math.hypot(destination.x - camera.x, destination.y - camera.y) * this.scale;
     // Smoothstep tiene una velocidad máxima de 1.5 * distancia / duración.

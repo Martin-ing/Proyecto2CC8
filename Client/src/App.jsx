@@ -42,7 +42,7 @@ function Navigation({ client, state }) {
         <button className="direction right" aria-label="Mover a la derecha" title="Mover a la derecha: un tile" disabled={!state.pan.right} onClick={() => client.pan(1, 0)}><Icon name="right" size={19} /></button>
       </div>
     </div>
-    <div className="level-line"><span>{image ? view.zoom === 0 ? 'Vista general · ROOT' : `Nivel ${view.zoom}` : 'Sin imagen seleccionada'}</span><span>{image ? `${view.zoom} / ${image.maxZoom}` : '—'}</span></div>
+    <div className="level-line"><span>{image ? view.zoom === 0 ? 'Vista general · ROOT' : `Nivel ${view.zoom}` : 'Sin imagen seleccionada'}</span><span>{image ? `${view.zoom} / ${image.maxZoom}${view.visualZoom > 1 ? ` · ${view.visualZoom}×` : ''}` : '—'}</span></div>
     <div className="level-track"><span style={{ width: `${progress}%` }} /></div>
     <p className={`navigation-hint ${transitioning || state.panning ? 'is-transitioning' : ''}`}>{transitioning ? <><span className="spinner" /> Ajustando zoom · 1 segundo</> : state.panning ? <><span className="spinner" /> Desplazando a la siguiente posición</> : state.dragging ? 'Arrastrando · suelta para detenerte.' : 'Arrastra para explorar · rueda para zoom.'}</p>
   </section>;
@@ -67,7 +67,7 @@ function Catalog({ client, state }) {
         </article>;
       })}
     </div>
-    <label className="format-control" htmlFor="rootFormat"><span>Formato de ROOT</span><select id="rootFormat" value={state.format} disabled={state.rootLoading} onChange={event => client.setFormat(event.target.value)}><option value="RGBA8888">RGBA8888 · 4 bytes/píxel</option><option value="RGBA4444">RGBA4444 · 2 bytes/píxel</option></select></label>
+    <label className="format-control" htmlFor="rootFormat"><span>Formato de ROOT</span><select id="rootFormat" value={state.format} disabled={state.rootLoading} onChange={event => client.setFormat(event.target.value)}><option value="RGBA4444">RGBA4444 · 2 bytes/píxel</option><option value="RGBA8888">RGBA8888 · 4 bytes/píxel</option></select></label>
     <p className="field-hint">Se aplica al abrir una imagen.</p>
   </section>;
 }
@@ -77,7 +77,7 @@ function Viewer({ canvasRef, client, state }) {
   const rootPercent = state.rootProgress.total ? Math.round(state.rootProgress.received / state.rootProgress.total * 100) : 0;
   const tilePercent = state.visibleTotal ? state.visibleReady / state.visibleTotal * 100 : rootInfo ? 100 : 0;
   return <section className="viewer-panel" aria-labelledby="viewer-title">
-    <div className="viewer-heading"><div><p className="eyebrow">ESPACIO DE EXPLORACIÓN</p><h1 id="viewer-title">{image?.name || 'Una imagen, todos sus detalles.'}</h1></div><span className="viewer-mode"><Icon name="layers" size={15} />{image ? view.zoom === 0 ? 'ROOT' : `Nivel ${view.zoom}` : 'Visor'}</span></div>
+    <div className="viewer-heading"><div><p className="eyebrow">ESPACIO DE EXPLORACIÓN</p><h1 id="viewer-title">{image?.name || 'Una imagen, todos sus detalles.'}</h1></div><span className="viewer-mode"><Icon name="layers" size={15} />{image ? view.zoom === 0 ? 'ROOT' : `Nivel ${view.zoom}` : 'Visor'}{view.visualZoom > 1 ? ` · ${view.visualZoom}×` : ''}</span></div>
     <div className={`canvas-stage ${rootInfo ? 'has-image' : ''}`}>
       <div className="canvas-frame">
         <canvas id="rootCanvas" ref={canvasRef} tabIndex={0} className={state.dragging ? 'is-dragging' : state.canDrag ? 'can-drag' : ''} aria-label={image ? `Visor de ${image.name}. Arrastra para mover; más y menos para zoom; flechas para desplazarte entre posiciones.` : 'Visor de imágenes'} aria-busy={rootLoading || transitioning || state.panning}
@@ -93,13 +93,13 @@ function Viewer({ canvasRef, client, state }) {
         </div>}
       </div>
       {rootInfo && <div className="canvas-corner"><span className="small-dot" />ROOT en memoria</div>}
-      {transitioning && <div className="transition-badge" role="status"><span className="spinner" />Nivel {state.transitionFrom} → {view.zoom}</div>}
+      {transitioning && <div className="transition-badge" role="status"><span className="spinner" />{state.transitionFrom === view.zoom ? `Ampliación ${view.visualZoom || 1}×` : `Nivel ${state.transitionFrom} → ${view.zoom}`}</div>}
     </div>
-    <div className="viewer-caption"><span><span className={`small-dot ${rootInfo ? 'green' : ''}`} />{rootInfo ? view.zoom === 0 ? 'Vista general completa' : state.visibleReady === state.visibleTotal ? 'Detalle completo' : 'Completando detalle sobre el fondo anterior' : 'Esperando imagen'}</span><span>{image ? `${integer(image.width)} × ${integer(image.height)} px` : 'Carga progresiva por niveles'}</span></div>
+    <div className="viewer-caption"><span><span className={`small-dot ${rootInfo ? 'green' : ''}`} />{rootInfo ? view.zoom === 0 ? view.visualZoom > 1 ? 'ROOT ampliada' : 'Vista general completa' : state.renderedReady === state.visibleTotal ? 'Detalle completo' : state.visibleReady === state.visibleTotal ? 'Detalle recibido · dibujando' : 'Completando detalle sobre el fondo anterior' : 'Esperando imagen'}</span><span>{image ? `${integer(image.width)} × ${integer(image.height)} px` : 'Carga progresiva por niveles'}</span></div>
     <div className="metrics">
       <div className="metric"><span className="metric-label">NIVEL ACTUAL</span><strong>{image ? String(view.zoom).padStart(2, '0') : '—'}<small>{image ? ` / ${image.maxZoom}` : ''}</small></strong><span>{image ? view.zoom === 0 ? 'Vista general · ROOT' : `${integer(state.axisTiles)} × ${integer(state.axisTiles)} tiles en el nivel` : 'Selecciona una imagen'}</span></div>
-      <div className="metric"><span className="metric-label">TILES VISIBLES</span><strong>{rootInfo ? view.zoom === 0 ? 'ROOT' : state.visibleReady : '—'}<small>{view.zoom > 0 ? ` / ${state.visibleTotal}` : ''}</small></strong><div className="metric-progress"><span style={{ width: `${tilePercent}%` }} /></div></div>
-      <div className="metric"><span className="metric-label">CACHÉ DE TILES</span><strong>{state.cacheSize}<small> / 64</small></strong><span>{mib(state.cacheBytes)} · reloj Nth-chance</span></div>
+      <div className="metric"><span className="metric-label">DETALLE RECIBIDO</span><strong>{rootInfo ? view.zoom === 0 ? 'ROOT' : state.visibleReady : '—'}<small>{view.zoom > 0 ? ` / ${state.visibleTotal}` : ''}</small></strong><div className="metric-progress"><span style={{ width: `${tilePercent}%` }} /></div><span>{view.zoom > 0 ? `${state.visibleTotal - state.visibleReady} por recibir · ${state.renderedReady} dibujados` : 'Vista general'}</span></div>
+      <div className="metric"><span className="metric-label">CACHÉ DE TILES</span><strong>{state.cacheSize}<small> / {state.clockCache.limit}</small></strong><span>{mib(state.cacheBytes)} · ocupación total</span><span>{state.desiredReady}/{state.desiredCount} del plan actual</span></div>
       <div className="metric"><span className="metric-label">POSICIÓN ACTUAL</span><strong className="coordinates">{view.zoom > 0 ? `${view.currentX}, ${view.currentY}` : '—'}</strong><span>{view.zoom > 0 ? 'Celda del centro · ventana base 4 × 4' : 'Espacio virtual completo'}</span></div>
     </div>
   </section>;
